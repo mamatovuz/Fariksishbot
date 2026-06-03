@@ -2,13 +2,13 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import warnings
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
-from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
-from pymongo.errors import OperationFailure
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -36,30 +36,26 @@ DEFAULT_BOT_TOKEN = "8405546234:AAHwIx4gxRxtc-erFp7tckvNLNRlNQjYFV8"
 DEFAULT_ADMIN_IDS = "7903688837"
 DEFAULT_ADMIN_CHAT_ID = "7903688837"
 DEFAULT_PUBLISH_CHAT_ID = "-1003994819171"
-DEFAULT_MONGO_URI = "mongodb://mongo:PbUsRTHTsTtvIGavTgKUogwmsSiFTnVK@acela.proxy.rlwy.net:24829"
-DEFAULT_MONGO_DB_NAME = "fariks_aloqa_bot"
-DEFAULT_REAPPLY_DAYS = "7"
+DEFAULT_DB_FILE = "bot.db"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or DEFAULT_BOT_TOKEN
 ADMIN_IDS_TEXT = os.getenv("ADMIN_IDS") or DEFAULT_ADMIN_IDS
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or DEFAULT_ADMIN_CHAT_ID
 PUBLISH_CHAT_ID = os.getenv("PUBLISH_CHAT_ID") or DEFAULT_PUBLISH_CHAT_ID or ADMIN_CHAT_ID
-MONGO_URI = os.getenv("MONGO_URI") or DEFAULT_MONGO_URI
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME") or DEFAULT_MONGO_DB_NAME
 ADMIN_IDS = {
     int(admin_id.strip())
     for admin_id in ADMIN_IDS_TEXT.split(",")
     if admin_id.strip().lstrip("-").isdigit()
 }
-REAPPLY_DAYS = int(os.getenv("REAPPLY_DAYS") or DEFAULT_REAPPLY_DAYS)
+DB_FILE = Path(os.getenv("DB_FILE") or DEFAULT_DB_FILE)
 
 FULL_NAME, PHONE, AGE, ROLE_CHOICE, DIRECTION, LANGUAGES, EXPERIENCE_CHOICE, EXPERIENCE_YEARS, CERTIFICATES = range(9)
 ADD_ADMIN_TARGET, REMOVE_ADMIN_TARGET = range(100, 102)
 
 ROLE_KEYBOARD = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("Admin / Support", callback_data="role:admin")],
-        [InlineKeyboardButton("O'qituvchi", callback_data="role:teacher")],
+        [InlineKeyboardButton("🛠 Admin / Support", callback_data="role:admin")],
+        [InlineKeyboardButton("👨‍🏫 O'qituvchi", callback_data="role:teacher")],
     ]
 )
 EXPERIENCE_INLINE_KEYBOARD = InlineKeyboardMarkup(
@@ -75,13 +71,11 @@ CERTIFICATE_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 ADMIN_MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["Ariza yuborish"], ["Admin panel"]],
+    [["📝 Ariza yuborish"], ["🛠 Admin panel"]],
     resize_keyboard=True,
 )
 
 admin_pending_actions: dict[int, int] = {}
-mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-mongo_db = mongo_client[MONGO_DB_NAME]
 
 phone_pattern = re.compile(r"^\+?\d[\d\s()\-]{6,}$")
 
@@ -101,50 +95,116 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    return datetime.fromisoformat(value)
+def db_connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_FILE)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
 def init_db() -> None:
-    mongo_client.admin.command("ping")
-    create_mongo_indexes()
+    with db_connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                username_lower TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                username_lower TEXT,
+                added_by INTEGER,
+                added_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                role TEXT NOT NULL DEFAULT 'teacher',
+                full_name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                age TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                languages TEXT NOT NULL DEFAULT '',
+                experience TEXT NOT NULL,
+                certificates_json TEXT NOT NULL,
+                certificate_count INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                decided_at TEXT,
+                decided_by INTEGER
+            )
+            """
+        )
+        ensure_columns(connection, "users", {"username_lower": "TEXT"})
+        ensure_columns(connection, "admins", {"username_lower": "TEXT"})
+        ensure_columns(
+            connection,
+            "applications",
+            {
+                "role": "TEXT NOT NULL DEFAULT 'teacher'",
+                "languages": "TEXT NOT NULL DEFAULT ''",
+            },
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(username_lower)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_admins_username_lower ON admins(username_lower)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_applications_user_id ON applications(user_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)")
 
 
-def create_mongo_indexes() -> None:
-    index_tasks = [
-        (mongo_db.users, [("username_lower", ASCENDING)], {}),
-        (mongo_db.admins, [("username_lower", ASCENDING)], {}),
-        (mongo_db.applications, [("id", ASCENDING)], {"unique": True}),
-        (mongo_db.applications, [("user_id", ASCENDING), ("id", DESCENDING)], {}),
-        (mongo_db.applications, [("status", ASCENDING)], {}),
-    ]
-
-    for collection, keys, options in index_tasks:
-        try:
-            collection.create_index(keys, **options)
-        except OperationFailure as error:
-            logger.warning("MongoDB index yaratilmadi: %s", format_runtime_error(error))
+def ensure_columns(
+    connection: sqlite3.Connection,
+    table_name: str,
+    columns: dict[str, str],
+) -> None:
+    existing_columns = {
+        row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})")
+    }
+    for column_name, column_type in columns.items():
+        if column_name not in existing_columns:
+            connection.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+            )
 
 
 def upsert_user(user) -> None:
     if not user:
         return
-    mongo_db.users.update_one(
-        {"_id": user.id},
-        {
-            "$set": {
-                "user_id": user.id,
-                "username": user.username,
-                "username_lower": user.username.lower() if user.username else None,
-                "first_name": user.first_name,
-                "last_name": user.last_name,
-                "updated_at": now_iso(),
-            }
-        },
-        upsert=True,
-    )
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO users (
+                user_id, username, username_lower, first_name, last_name, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                username_lower = excluded.username_lower,
+                first_name = excluded.first_name,
+                last_name = excluded.last_name,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user.id,
+                user.username,
+                user.username.lower() if user.username else None,
+                user.first_name,
+                user.last_name,
+                now_iso(),
+            ),
+        )
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -153,15 +213,29 @@ def is_admin(user_id: int | None) -> bool:
     if user_id in ADMIN_IDS:
         return True
 
-    return mongo_db.admins.find_one({"_id": user_id}) is not None
+    with db_connect() as connection:
+        row = connection.execute(
+            "SELECT 1 FROM admins WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return row is not None
 
 
 def get_stats() -> dict:
-    users_count = mongo_db.users.count_documents({})
-    db_admin_ids = {admin["_id"] for admin in mongo_db.admins.find({}, {"_id": 1})}
-    pending = mongo_db.applications.count_documents({"status": "pending"})
-    approved = mongo_db.applications.count_documents({"status": "approved"})
-    rejected = mongo_db.applications.count_documents({"status": "rejected"})
+    with db_connect() as connection:
+        users_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        db_admin_ids = {
+            row["user_id"] for row in connection.execute("SELECT user_id FROM admins")
+        }
+        pending = connection.execute(
+            "SELECT COUNT(*) FROM applications WHERE status = 'pending'"
+        ).fetchone()[0]
+        approved = connection.execute(
+            "SELECT COUNT(*) FROM applications WHERE status = 'approved'"
+        ).fetchone()[0]
+        rejected = connection.execute(
+            "SELECT COUNT(*) FROM applications WHERE status = 'rejected'"
+        ).fetchone()[0]
 
     return {
         "users": users_count,
@@ -174,32 +248,47 @@ def get_stats() -> dict:
 
 def find_user_by_username(username: str) -> dict | None:
     clean_username = username.lstrip("@").lower()
-    return mongo_db.users.find_one({"username_lower": clean_username})
+    with db_connect() as connection:
+        return connection.execute(
+            "SELECT * FROM users WHERE username_lower = ?",
+            (clean_username,),
+        ).fetchone()
 
 
 def find_user_by_id(user_id: int) -> dict | None:
-    return mongo_db.users.find_one({"_id": user_id})
+    with db_connect() as connection:
+        return connection.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
 
 
 def add_admin(user_id: int, username: str | None, added_by: int) -> None:
-    mongo_db.admins.update_one(
-        {"_id": user_id},
-        {
-            "$set": {
-                "user_id": user_id,
-                "username": username,
-                "username_lower": username.lower() if username else None,
-                "added_by": added_by,
-                "added_at": now_iso(),
-            }
-        },
-        upsert=True,
-    )
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO admins (user_id, username, username_lower, added_by, added_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                username_lower = excluded.username_lower,
+                added_by = excluded.added_by,
+                added_at = excluded.added_at
+            """,
+            (
+                user_id,
+                username,
+                username.lower() if username else None,
+                added_by,
+                now_iso(),
+            ),
+        )
 
 
 def remove_admin(user_id: int) -> bool:
-    result = mongo_db.admins.delete_one({"_id": user_id})
-    return result.deleted_count > 0
+    with db_connect() as connection:
+        cursor = connection.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        return cursor.rowcount > 0
 
 
 def resolve_admin_target(text: str) -> tuple[int | None, str | None, str | None]:
@@ -223,117 +312,76 @@ def resolve_admin_target(text: str) -> tuple[int | None, str | None, str | None]
     return None, None, "Username @ bilan yoki Telegram ID raqam ko'rinishida yuboring."
 
 
-def get_latest_application(user_id: int) -> dict | None:
-    return mongo_db.applications.find_one(
-        {"user_id": user_id},
-        sort=[("id", DESCENDING)],
-    )
-
-
 def get_application(application_id: int) -> dict | None:
-    return mongo_db.applications.find_one({"id": application_id})
-
-
-def can_submit_application(user_id: int) -> tuple[bool, str | None]:
-    latest = get_latest_application(user_id)
-    if not latest:
-        return True, None
-
-    if latest["status"] == "pending":
-        return (
-            False,
-            "Sizda ko'rib chiqilayotgan ariza bor. Admin tasdiqlashi yoki rad etishini kuting.",
-        )
-
-    if latest["status"] == "approved":
-        return False, "Sizning arizangiz tasdiqlangan. Qayta ariza yubora olmaysiz."
-
-    decided_at = parse_iso(latest["decided_at"]) or parse_iso(latest["created_at"])
-    if not decided_at:
-        return True, None
-
-    available_at = decided_at + timedelta(days=REAPPLY_DAYS)
-    current_time = datetime.now(timezone.utc)
-    if current_time < available_at:
-        seconds_left = (available_at - current_time).total_seconds()
-        days_left = max(1, int((seconds_left + 86399) // 86400))
-        return (
-            False,
-            f"Arizangiz rad etilgan. {days_left} kundan keyin qayta ariza yuborishingiz mumkin.",
-        )
-
-    return True, None
+    with db_connect() as connection:
+        return connection.execute(
+            "SELECT * FROM applications WHERE id = ?",
+            (application_id,),
+        ).fetchone()
 
 
 def create_application(user, user_data: dict) -> int:
     certificates = user_data.get("certificates", [])
-    application_id = get_next_sequence("applications")
-    mongo_db.applications.insert_one(
-        {
-            "_id": application_id,
-            "id": application_id,
-            "user_id": user.id,
-            "username": user.username,
-            "role": user_data["role"],
-            "full_name": user_data["full_name"],
-            "phone": user_data["phone"],
-            "age": user_data["age"],
-            "direction": user_data["direction"],
-            "languages": user_data.get("languages", ""),
-            "experience": user_data["experience"],
-            "certificates": certificates,
-            "certificate_count": len(certificates),
-            "status": "pending",
-            "created_at": now_iso(),
-            "decided_at": None,
-            "decided_by": None,
-        }
-    )
-    return application_id
-
-
-def get_next_sequence(name: str) -> int:
-    counter = mongo_db.counters.find_one_and_update(
-        {"_id": name},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
-    return int(counter["seq"])
+    with db_connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO applications (
+                user_id, username, role, full_name, phone, age, direction, languages,
+                experience, certificates_json, certificate_count, status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                user.id,
+                user.username,
+                user_data["role"],
+                user_data["full_name"],
+                user_data["phone"],
+                user_data["age"],
+                user_data["direction"],
+                user_data.get("languages", ""),
+                user_data["experience"],
+                json.dumps(certificates, ensure_ascii=False),
+                len(certificates),
+                now_iso(),
+            ),
+        )
+        return cursor.lastrowid
 
 
 def delete_application(application_id: int) -> None:
-    mongo_db.applications.delete_one({"id": application_id})
+    with db_connect() as connection:
+        connection.execute("DELETE FROM applications WHERE id = ?", (application_id,))
 
 
 def update_application_status(application_id: int, status: str, admin_id: int) -> None:
-    mongo_db.applications.update_one(
-        {"id": application_id},
-        {
-            "$set": {
-                "status": status,
-                "decided_at": now_iso(),
-                "decided_by": admin_id,
-            }
-        },
-    )
+    with db_connect() as connection:
+        connection.execute(
+            """
+            UPDATE applications
+            SET status = ?, decided_at = ?, decided_by = ?
+            WHERE id = ?
+            """,
+            (status, now_iso(), admin_id, application_id),
+        )
 
 
 def row_to_application(row: dict) -> dict:
+    row_data = dict(row)
     return {
-        "id": row["id"],
-        "user_id": row["user_id"],
-        "username": row.get("username"),
-        "role": row.get("role", "teacher"),
-        "full_name": row["full_name"],
-        "phone": row["phone"],
-        "age": row["age"],
-        "direction": row.get("direction", ""),
-        "languages": row.get("languages", ""),
-        "experience": row["experience"],
-        "certificates": row.get("certificates", json.loads(row.get("certificates_json", "[]"))),
-        "certificate_count": row.get("certificate_count", 0),
-        "status": row["status"],
+        "id": row_data["id"],
+        "user_id": row_data["user_id"],
+        "username": row_data.get("username"),
+        "role": row_data.get("role", "teacher"),
+        "full_name": row_data["full_name"],
+        "phone": row_data["phone"],
+        "age": row_data["age"],
+        "direction": row_data.get("direction", ""),
+        "languages": row_data.get("languages", ""),
+        "experience": row_data["experience"],
+        "certificates": json.loads(row_data.get("certificates_json") or "[]"),
+        "certificate_count": row_data.get("certificate_count", 0),
+        "status": row_data["status"],
     }
 
 
@@ -348,7 +396,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if is_admin(update.effective_user.id):
         await update.message.reply_text(
-            "Admin menyu ochildi.",
+            "🛠 Admin menyu ochildi.",
             reply_markup=ADMIN_MAIN_KEYBOARD,
         )
         return ConversationHandler.END
@@ -359,23 +407,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def begin_application(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     upsert_user(update.effective_user)
 
-    allowed, message = can_submit_application(update.effective_user.id)
-    if not allowed:
-        await update.message.reply_text(
-            message,
-            reply_markup=main_keyboard_for(update.effective_user.id),
-        )
-        return ConversationHandler.END
-
     context.user_data.clear()
     context.user_data["certificates"] = []
 
     await update.message.reply_text(
         "Assalomu alaykum! 👋\n"
-        "Ma'lumotlaringizni kiritish uchun quyidagi savollarga javob bering.",
+        "Fariks Aloqa jamoasiga ariza yuborish uchun savollarga javob bering.",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await update.message.reply_text("Ism va familiyangizni kiriting.")
+    await update.message.reply_text("👤 Ism va familiyangizni kiriting.")
     return FULL_NAME
 
 
@@ -386,7 +426,7 @@ async def full_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return FULL_NAME
 
     context.user_data["full_name"] = name
-    await update.message.reply_text("Telefon raqamingizni yuboring.")
+    await update.message.reply_text("📞 Telefon raqamingizni yuboring. Masalan: +998901234567")
     return PHONE
 
 
@@ -399,7 +439,7 @@ async def phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return PHONE
 
     context.user_data["phone"] = phone_number
-    await update.message.reply_text("Yoshingiz nechida?")
+    await update.message.reply_text("🎂 Yoshingiz nechida?")
     return AGE
 
 
@@ -411,7 +451,7 @@ async def age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data["age"] = age_text
     await update.message.reply_text(
-        "Qaysi yo'nalish bo'yicha ariza topshirmoqchisiz?",
+        "🚩 Qaysi yo'nalish bo'yicha ariza topshirmoqchisiz?",
         reply_markup=ROLE_KEYBOARD,
     )
     return ROLE_CHOICE
@@ -428,18 +468,19 @@ async def role_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if role == "teacher":
         context.user_data["direction_type"] = "teacher"
         await query.message.reply_text(
-            "Qaysi fan yoki yo'nalishni o'qitasiz? Masalan: Matematika"
+            "📚 Qaysi fan yoki yo'nalishni o'qitasiz? Masalan: Matematika"
         )
         return DIRECTION
 
     context.user_data["direction"] = "Admin / Support"
     context.user_data["certificates"] = []
-    await query.message.reply_text("Qaysi tillarni bilasiz? Masalan: O'zbek, Rus, Ingliz")
+    await query.message.reply_text("🌐 Qaysi tillarni bilasiz? Masalan: O'zbek, Rus, Ingliz")
     return LANGUAGES
 
 
 async def invalid_role_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
+    await reply_to_update(
+        update,
         "Iltimos, quyidagi tugmalardan birini tanlang.",
         reply_markup=ROLE_KEYBOARD,
     )
@@ -458,14 +499,14 @@ async def languages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def invalid_languages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Iltimos, tillarni matn ko'rinishida yozing.")
+    await reply_to_update(update, "🌐 Iltimos, tillarni matn ko'rinishida yozing.")
     return LANGUAGES
 
 
 async def ask_experience(update: Update) -> None:
     message = update.callback_query.message if update.callback_query else update.message
     await message.reply_text(
-        "Ushbu sohada tajribangiz bormi?",
+        "💼 Ushbu sohada tajribangiz bormi?",
         reply_markup=EXPERIENCE_INLINE_KEYBOARD,
     )
 
@@ -505,7 +546,7 @@ async def experience_choice_callback(
     choice = query.data.split(":", 1)[1]
     if choice == "yes":
         await query.message.reply_text(
-            "Necha yil yoki oy tajribangiz bor? Masalan: 2 yil yoki 6 oy",
+            "⏳ Necha yil yoki oy tajribangiz bor? Masalan: 2 yil yoki 6 oy",
             reply_markup=ReplyKeyboardRemove(),
         )
         return EXPERIENCE_YEARS
@@ -535,7 +576,7 @@ async def direction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def invalid_direction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Iltimos, fan yoki yo'nalishni matn ko'rinishida yozing.")
+    await reply_to_update(update, "📚 Iltimos, fan yoki yo'nalishni matn ko'rinishida yozing.")
     return DIRECTION
 
 
@@ -544,7 +585,7 @@ async def experience_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if "ha" in answer:
         await update.message.reply_text(
-            "Necha yil yoki oy tajribangiz bor? Masalan: 2 yil yoki 6 oy",
+            "⏳ Necha yil yoki oy tajribangiz bor? Masalan: 2 yil yoki 6 oy",
             reply_markup=ReplyKeyboardRemove(),
         )
         return EXPERIENCE_YEARS
@@ -572,10 +613,10 @@ async def experience_years(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def ask_certificates(update: Update) -> None:
     await update.message.reply_text(
-        "Sertifikatlaringiz rasmlarini yuboring. Bir nechta sertifikat bo'lsa, "
+        "📜 Sertifikatlaringiz rasmlarini yuboring. Bir nechta sertifikat bo'lsa, "
         "barchasini yuborishingiz mumkin.\n\n"
-        "Sertifikat bo'lmasa \"Skip\" tugmasini bosing yoki /skip yuboring.\n"
-        "Barcha rasmlarni yuborib bo'lgach, \"Tugatildi\" tugmasini bosing.",
+        "Sertifikat bo'lmasa \"⏭ Skip\" tugmasini bosing yoki /skip yuboring.\n"
+        "Barcha rasmlarni yuborib bo'lgach, \"✅ Tugatildi\" tugmasini bosing.",
         reply_markup=CERTIFICATE_KEYBOARD,
     )
 
@@ -584,7 +625,7 @@ async def save_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     certificate = get_certificate_info(update)
     if not certificate:
         await update.message.reply_text(
-            "Iltimos, sertifikat rasmini yuboring, \"Tugatildi\" yoki \"Skip\" tugmasini bosing.",
+            "📜 Iltimos, sertifikat rasmini yuboring, \"✅ Tugatildi\" yoki \"⏭ Skip\" tugmasini bosing.",
             reply_markup=CERTIFICATE_KEYBOARD,
         )
         return CERTIFICATES
@@ -592,8 +633,8 @@ async def save_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data.setdefault("certificates", []).append(certificate)
 
     await update.message.reply_text(
-        "Sertifikat qabul qilindi. Yana rasm yuborishingiz yoki "
-        "\"Tugatildi\" tugmasini bosishingiz mumkin.",
+        "✅ Sertifikat qabul qilindi. Yana rasm yuborishingiz yoki "
+        "\"✅ Tugatildi\" tugmasini bosishingiz mumkin.",
         reply_markup=CERTIFICATE_KEYBOARD,
     )
     return CERTIFICATES
@@ -621,16 +662,6 @@ def get_certificate_info(update: Update) -> dict | None:
 async def certificates_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     upsert_user(user)
-
-    allowed, message = can_submit_application(user.id)
-    if not allowed:
-        await reply_to_update(
-            update,
-            message,
-            reply_markup=main_keyboard_for(user.id),
-        )
-        context.user_data.clear()
-        return ConversationHandler.END
 
     required_fields = ["full_name", "phone", "age", "role", "direction", "experience"]
     if context.user_data.get("role") == "admin":
@@ -660,7 +691,7 @@ async def certificates_done(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     await reply_to_update(
         update,
-        "Arizangiz adminlarga yuborildi. Javobni kuting. ✅",
+        "✅ Arizangiz adminlarga yuborildi. Javobni kuting.",
         reply_markup=main_keyboard_for(user.id),
     )
     context.user_data.clear()
@@ -895,7 +926,7 @@ async def handle_application_decision(
     await notify_user(
         context,
         application["user_id"],
-        f"Arizangiz rad etildi. {REAPPLY_DAYS} kundan keyin qayta yuborishingiz mumkin.",
+        "Arizangiz rad etildi. Yangi ariza yuborishingiz mumkin.",
     )
     await remove_decision_buttons(query)
     await query.answer("Ariza rad etildi.")
@@ -960,7 +991,7 @@ def build_admin_panel_text() -> str:
         "🛠 Admin panel\n\n"
         f"👥 Foydalanuvchilar soni: {stats['users']}\n"
         f"👮 Adminlar soni: {stats['admins']}\n"
-        f"⏳ Ko'rilayotgan arizalar: {stats['pending']}\n"
+        f"📨 Kutilayotgan arizalar: {stats['pending']}\n"
         f"✅ Tasdiqlangan: {stats['approved']}\n"
         f"❌ Rad etilgan: {stats['rejected']}"
     )
@@ -1135,7 +1166,7 @@ def main() -> None:
     application_conversation = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            MessageHandler(filters.Regex(r"^Ariza yuborish$"), begin_application),
+            MessageHandler(filters.Regex(r"^(📝\s*)?Ariza yuborish$"), begin_application),
         ],
         states={
             FULL_NAME: [
@@ -1196,7 +1227,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern=r"^admin:refresh$"))
     application.add_handler(CommandHandler("myid", my_id))
     application.add_handler(CommandHandler("cancel", admin_cancel))
-    application.add_handler(MessageHandler(filters.Regex(r"^Admin panel$"), admin_panel))
+    application.add_handler(MessageHandler(filters.Regex(r"^(🛠\s*)?Admin panel$"), admin_panel))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pending_text)
     )
@@ -1221,10 +1252,8 @@ def format_runtime_error(error: Exception | None) -> str:
         return "Admin yoki kanal ID topilmadi. ADMIN_CHAT_ID/PUBLISH_CHAT_ID ni tekshiring."
     if "forbidden" in lowered:
         return "Botda ruxsat yo'q. Bot kanal/guruhda adminmi yoki user botni start qilganmi, tekshiring."
-    if "outofdiskspace" in lowered or "available disk space" in lowered:
-        return "MongoDB serverida bo'sh joy kam. Railway Mongo disk hajmini oshiring yoki eski ma'lumotlarni tozalang."
-    if "serverselectiontimeout" in lowered or "timed out" in lowered:
-        return "MongoDB ulanishi ishlamadi. MONGO_URI yoki internetni tekshiring."
+    if "database is locked" in lowered:
+        return "SQLite bazasi band. Botni ikki marta ishga tushirmaganingizni tekshiring."
     if not text:
         return error.__class__.__name__
     return text

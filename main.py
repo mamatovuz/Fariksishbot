@@ -802,11 +802,6 @@ def build_media_group(certificates: list[dict], caption: str | None) -> list:
 
 
 def build_application_caption(application: dict) -> str:
-    certificates_text = (
-        f"{application['certificate_count']} ta"
-        if application["certificate_count"]
-        else "Sertifikat yo'q"
-    )
     text = (
         "🆕 Yangi nomzod\n\n"
         f"👤 Ism: {application['full_name']}\n"
@@ -817,7 +812,15 @@ def build_application_caption(application: dict) -> str:
     )
     if application.get("languages"):
         text += f"🌐 Tillar: {application['languages']}\n"
-    text += f"📜 Sertifikatlar: {certificates_text}"
+    if application.get("role") != "admin":
+        certificates_text = (
+            f"{application['certificate_count']} ta"
+            if application["certificate_count"]
+            else "Sertifikat yo'q"
+        )
+        text += f"📜 Sertifikatlar: {certificates_text}"
+    else:
+        text = text.rstrip()
     return text
 
 

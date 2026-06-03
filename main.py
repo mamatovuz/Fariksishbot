@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN") or DEFAULT_BOT_TOKEN
 ADMIN_IDS_TEXT = os.getenv("ADMIN_IDS") or DEFAULT_ADMIN_IDS
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or DEFAULT_ADMIN_CHAT_ID
 PUBLISH_CHAT_ID = os.getenv("PUBLISH_CHAT_ID") or DEFAULT_PUBLISH_CHAT_ID or ADMIN_CHAT_ID
+WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
+WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH") or "telegram").strip("/") or "telegram"
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+PORT = int(os.getenv("PORT") or "8080")
 ADMIN_IDS = {
     int(admin_id.strip())
     for admin_id in ADMIN_IDS_TEXT.split(",")
@@ -76,6 +81,7 @@ ADMIN_MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 admin_pending_actions: dict[int, int] = {}
+last_conflict_warning_at = 0.0
 
 phone_pattern = re.compile(r"^\+?\d[\d\s()\-]{6,}$")
 
@@ -1140,6 +1146,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global last_conflict_warning_at
+
+    if is_polling_conflict(context.error):
+        current_time = time.monotonic()
+        if current_time - last_conflict_warning_at > 60:
+            logger.warning("Xatolik: %s", format_runtime_error(context.error))
+            last_conflict_warning_at = current_time
+        return
+
     logger.error("Xatolik: %s", format_runtime_error(context.error))
 
     if isinstance(update, Update) and update.effective_message:
@@ -1150,6 +1165,46 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def on_bot_ready(application: Application) -> None:
     logger.info("Bot ishga tushdi.")
+
+
+def is_polling_conflict(error: Exception | None) -> bool:
+    if error is None:
+        return False
+
+    text = str(error).lower()
+    return "terminated by other getupdates" in text or (
+        "conflict" in text and "getupdates" in text
+    )
+
+
+def get_webhook_base_url() -> str | None:
+    if WEBHOOK_URL:
+        return WEBHOOK_URL.rstrip("/")
+    if RAILWAY_PUBLIC_DOMAIN:
+        return f"https://{RAILWAY_PUBLIC_DOMAIN}".rstrip("/")
+    return None
+
+
+def run_bot(application: Application) -> None:
+    webhook_base_url = get_webhook_base_url()
+    if webhook_base_url:
+        webhook_url = f"{webhook_base_url}/{WEBHOOK_PATH}"
+        logger.info("Bot webhook rejimida ishga tushmoqda.")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        return
+
+    logger.info("Bot polling rejimida ishga tushmoqda.")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 def main() -> None:
@@ -1233,7 +1288,7 @@ def main() -> None:
     )
     application.add_error_handler(error_handler)
     try:
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        run_bot(application)
     except Exception as error:
         logger.error("Botni ishga tushirishda xatolik: %s", format_runtime_error(error))
         sys.exit(1)
@@ -1252,6 +1307,13 @@ def format_runtime_error(error: Exception | None) -> str:
         return "Admin yoki kanal ID topilmadi. ADMIN_CHAT_ID/PUBLISH_CHAT_ID ni tekshiring."
     if "forbidden" in lowered:
         return "Botda ruxsat yo'q. Bot kanal/guruhda adminmi yoki user botni start qilganmi, tekshiring."
+    if is_polling_conflict(error):
+        return (
+            "Bot boshqa joyda ham ishlayapti. Bir xil token bilan faqat bitta bot "
+            "ishlashi kerak: local `python main.py`ni to'xtating yoki Railway replicasini 1 ta qiling."
+        )
+    if "webhook" in lowered and "tornado" in lowered:
+        return "Webhook uchun kerakli kutubxona yo'q. `pip install -r requirements.txt` qiling."
     if "database is locked" in lowered:
         return "SQLite bazasi band. Botni ikki marta ishga tushirmaganingizni tekshiring."
     if not text:

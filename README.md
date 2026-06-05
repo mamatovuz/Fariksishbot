@@ -20,3 +20,10 @@ joyda ishlayapti. Kompyuterdagi eski `python main.py` jarayonini to'xtating yoki
 replica sonini 1 taga tushiring.
 
 Admin paneldagi `📊 Excel` tugmasi barcha arizalarni `.xlsx` fayl ko'rinishida yuboradi.
+Excel eksportida nomzod rasmi ham jadval ichida ko'rinadi.
+
+Admin panelda arizalarni status bo'yicha ko'rish, ism/telefon/filial bo'yicha qidirish,
+filial bo'yicha filter qilish va rad etishda sabab yozish imkoniyati bor.
+
+Foydalanuvchi tug'ilgan sanani kiritadi, bot yoshni avtomatik hisoblaydi. Rasm yuborishdan
+oldin ariza ma'lumotlarini tekshirib, kerak bo'lsa tahrirlashi mumkin.

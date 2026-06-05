@@ -9,10 +9,13 @@ import warnings
 from copy import copy
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from dotenv import load_dotenv
 from openpyxl import Workbook
+from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.utils import get_column_letter
+from PIL import Image as PILImage
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -77,8 +80,10 @@ EXCEL_FILE = Path(os.getenv("EXCEL_FILE") or DEFAULT_EXCEL_FILE)
     MOTIVATION,
     PHONE,
     RECENT_PHOTO,
-) = range(19)
-ADD_ADMIN_TARGET, REMOVE_ADMIN_TARGET = range(100, 102)
+    REVIEW_APPLICATION,
+    EDIT_FIELD,
+) = range(21)
+ADD_ADMIN_TARGET, REMOVE_ADMIN_TARGET, SEARCH_APPLICATION_TARGET, FILTER_BRANCH_TARGET = range(100, 104)
 
 EDUCATION_LABELS = {
     "higher": "Oliy ma'lumotli",
@@ -147,6 +152,7 @@ ADMIN_MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 admin_pending_actions: dict[int, int] = {}
+admin_reject_targets: dict[int, int] = {}
 last_conflict_warning_at = 0.0
 
 phone_pattern = re.compile(r"^\+?\d[\d\s()\-]{6,}$")
@@ -228,6 +234,7 @@ def init_db() -> None:
                 certificates_json TEXT NOT NULL DEFAULT '[]',
                 certificate_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
+                reject_reason TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 decided_at TEXT,
                 decided_by INTEGER
@@ -259,6 +266,7 @@ def init_db() -> None:
                 "direction": "TEXT NOT NULL DEFAULT ''",
                 "certificates_json": "TEXT NOT NULL DEFAULT '[]'",
                 "certificate_count": "INTEGER NOT NULL DEFAULT 0",
+                "reject_reason": "TEXT NOT NULL DEFAULT ''",
             },
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(username_lower)")
@@ -428,6 +436,51 @@ def get_all_application_rows() -> list[sqlite3.Row]:
         return list(connection.execute("SELECT * FROM applications ORDER BY id"))
 
 
+def get_application_rows_by_status(status: str, limit: int = 10) -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                "SELECT * FROM applications WHERE status = ? ORDER BY id DESC LIMIT ?",
+                (status, limit),
+            )
+        )
+
+
+def search_application_rows(query: str, limit: int = 10) -> list[sqlite3.Row]:
+    like_query = f"%{query.strip()}%"
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                """
+                SELECT * FROM applications
+                WHERE full_name LIKE ?
+                   OR phone LIKE ?
+                   OR branch LIKE ?
+                   OR username LIKE ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (like_query, like_query, like_query, like_query, limit),
+            )
+        )
+
+
+def get_application_rows_by_branch(branch_query: str, limit: int = 10) -> list[sqlite3.Row]:
+    like_query = f"%{branch_query.strip()}%"
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                """
+                SELECT * FROM applications
+                WHERE branch LIKE ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (like_query, limit),
+            )
+        )
+
+
 def create_application(user, user_data: dict) -> int:
     photo = user_data.get("recent_photo", {})
     with db_connect() as connection:
@@ -440,7 +493,7 @@ def create_application(user, user_data: dict) -> int:
                 fariks_duration, motivation, recent_photo_json, role, age, direction,
                 certificates_json, certificate_count, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'employee', '', ?, '[]', 0, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'employee', ?, ?, '[]', 0, 'pending', ?)
             """,
             (
                 user.id,
@@ -463,6 +516,7 @@ def create_application(user, user_data: dict) -> int:
                 user_data["fariks_duration"],
                 user_data["motivation"],
                 json.dumps(photo, ensure_ascii=False),
+                user_data.get("age", ""),
                 user_data["branch"],
                 now_iso(),
             ),
@@ -479,15 +533,20 @@ def delete_application(application_id: int) -> None:
     safe_sync_excel_file()
 
 
-def update_application_status(application_id: int, status: str, admin_id: int) -> None:
+def update_application_status(
+    application_id: int,
+    status: str,
+    admin_id: int,
+    reject_reason: str = "",
+) -> None:
     with db_connect() as connection:
         connection.execute(
             """
             UPDATE applications
-            SET status = ?, decided_at = ?, decided_by = ?
+            SET status = ?, decided_at = ?, decided_by = ?, reject_reason = ?
             WHERE id = ?
             """,
-            (status, now_iso(), admin_id, application_id),
+            (status, now_iso(), admin_id, reject_reason, application_id),
         )
     safe_sync_excel_file()
 
@@ -500,6 +559,7 @@ def row_to_application(row: sqlite3.Row | dict) -> dict:
         "username": row_data.get("username"),
         "full_name": row_data.get("full_name", ""),
         "birth_date": row_data.get("birth_date", ""),
+        "age": row_data.get("age", ""),
         "address": row_data.get("address", ""),
         "branch": row_data.get("branch", "") or row_data.get("direction", ""),
         "education": row_data.get("education", ""),
@@ -517,6 +577,7 @@ def row_to_application(row: sqlite3.Row | dict) -> dict:
         "motivation": row_data.get("motivation", ""),
         "recent_photo": json.loads(row_data.get("recent_photo_json") or "{}"),
         "status": row_data.get("status", ""),
+        "reject_reason": row_data.get("reject_reason", ""),
         "created_at": row_data.get("created_at", ""),
         "decided_at": row_data.get("decided_at", ""),
         "decided_by": row_data.get("decided_by", ""),
@@ -575,6 +636,7 @@ async def birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return BIRTH_DATE
 
     context.user_data["birth_date"] = value
+    context.user_data["age"] = str(calculate_age(value))
     await update.message.reply_text("3. 📍 Yashash manzilingizni to'liq yozing.")
     return ADDRESS
 
@@ -585,6 +647,15 @@ def is_valid_birth_date(value: str) -> bool:
     except ValueError:
         return False
     return datetime(1940, 1, 1) <= parsed <= datetime.now()
+
+
+def calculate_age(birth_date_text: str) -> int:
+    birth_date_value = datetime.strptime(birth_date_text, "%d.%m.%Y").date()
+    today = datetime.now().date()
+    age = today.year - birth_date_value.year
+    if (today.month, today.day) < (birth_date_value.month, birth_date_value.day):
+        age -= 1
+    return age
 
 
 async def address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -853,8 +924,261 @@ async def phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return PHONE
 
     context.user_data["phone"] = value
-    await update.message.reply_text("18. 📷 Oxirgi 1 oy ichida tushgan rasmingizni yuboring.")
-    return RECENT_PHOTO
+    await show_application_review(update.message, context)
+    return REVIEW_APPLICATION
+
+
+def build_review_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Tasdiqlash", callback_data="review:confirm"),
+                InlineKeyboardButton("✏️ Tahrirlash", callback_data="review:edit"),
+            ],
+            [InlineKeyboardButton("❌ Bekor qilish", callback_data="review:cancel")],
+        ]
+    )
+
+
+def build_edit_fields_keyboard() -> InlineKeyboardMarkup:
+    fields = [
+        ("👤 Ism", "full_name"),
+        ("🎂 Tug'ilgan sana", "birth_date"),
+        ("📍 Manzil", "address"),
+        ("🏢 Filial", "branch"),
+        ("🎓 Ma'lumot", "education"),
+        ("💼 Tajriba", "experience"),
+        ("🏬 Oldingi ish", "previous_job"),
+        ("⚖️ Sudlangan", "convicted"),
+        ("👪 Oilaviy holat", "family_status"),
+        ("💰 Oldingi maosh", "previous_salary"),
+        ("💵 Kutilgan maosh", "expected_salary"),
+        ("📝 Word", "word_level"),
+        ("📊 Excel", "excel_level"),
+        ("🌐 Tillar", "languages"),
+        ("⏳ Ishlash niyati", "fariks_duration"),
+        ("❓ Nega Fariks", "motivation"),
+        ("📞 Telefon", "phone"),
+    ]
+    rows = []
+    for index in range(0, len(fields), 2):
+        rows.append(
+            [
+                InlineKeyboardButton(label, callback_data=f"edit:{field}")
+                for label, field in fields[index : index + 2]
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="edit:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_edit_value_keyboard(field: str) -> InlineKeyboardMarkup:
+    if field == "education":
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🎓 Oliy ma'lumotli", callback_data="editval:education:higher")],
+                [InlineKeyboardButton("🏥 O'rta maxsus", callback_data="editval:education:secondary")],
+            ]
+        )
+
+    if field == "convicted":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ Ha", callback_data="editval:convicted:yes"),
+                    InlineKeyboardButton("❌ Yo'q", callback_data="editval:convicted:no"),
+                ]
+            ]
+        )
+
+    if field in {"word_level", "excel_level"}:
+        prefix = "word_level" if field == "word_level" else "excel_level"
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("❌ Bilmayman", callback_data=f"editval:{prefix}:unknown"),
+                    InlineKeyboardButton("🔹 Bazaviy", callback_data=f"editval:{prefix}:basic"),
+                ],
+                [
+                    InlineKeyboardButton("🔸 O'rtacha", callback_data=f"editval:{prefix}:medium"),
+                    InlineKeyboardButton("✅ Yaxshi", callback_data=f"editval:{prefix}:good"),
+                ],
+            ]
+        )
+
+    return InlineKeyboardMarkup([])
+
+
+def build_review_text(data: dict) -> str:
+    return (
+        "📋 Arizangizni tekshirib chiqing:\n\n"
+        f"👤 Ism-sharif: {data.get('full_name', '')}\n"
+        f"🎂 Tug'ilgan sana: {data.get('birth_date', '')}\n"
+        f"🔢 Yosh: {data.get('age', '')}\n"
+        f"📍 Manzil: {data.get('address', '')}\n"
+        f"🏢 Filial: {data.get('branch', '')}\n"
+        f"🎓 Ma'lumot: {data.get('education', '')}\n"
+        f"💼 Soha tajribasi: {data.get('experience', '')}\n"
+        f"🏬 Oldingi ish joyi: {data.get('previous_job', '')}\n"
+        f"⚖️ Sudlangan: {data.get('convicted', '')}\n"
+        f"👪 Oilaviy holati: {data.get('family_status', '')}\n"
+        f"💰 Oldingi maosh: {data.get('previous_salary', '')}\n"
+        f"💵 Kutilayotgan maosh: {data.get('expected_salary', '')}\n"
+        f"📝 Word: {data.get('word_level', '')}\n"
+        f"📊 Excel: {data.get('excel_level', '')}\n"
+        f"🌐 Tillar: {data.get('languages', '')}\n"
+        f"⏳ Fariksda ishlash niyati: {data.get('fariks_duration', '')}\n"
+        f"❓ Nega Fariks: {data.get('motivation', '')}\n"
+        f"📞 Telefon: {data.get('phone', '')}"
+    )
+
+
+async def show_application_review(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await message.reply_text(
+        build_review_text(context.user_data),
+        reply_markup=build_review_keyboard(),
+    )
+
+
+async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    action = query.data.split(":", 1)[1]
+    if action == "confirm":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("18. 📷 Oxirgi 1 oy ichida tushgan rasmingizni yuboring.")
+        return RECENT_PHOTO
+
+    if action == "edit":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "Qaysi ma'lumotni tahrirlaysiz?",
+            reply_markup=build_edit_fields_keyboard(),
+        )
+        return REVIEW_APPLICATION
+
+    context.user_data.clear()
+    await query.edit_message_text("Ariza to'ldirish bekor qilindi.")
+    await query.message.reply_text(
+        "Qayta boshlash uchun /start bosing.",
+        reply_markup=main_keyboard_for(query.from_user.id),
+    )
+    return ConversationHandler.END
+
+
+async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    field = query.data.split(":", 1)[1]
+    if field == "back":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await show_application_review(query.message, context)
+        return REVIEW_APPLICATION
+
+    if field in {"education", "convicted", "word_level", "excel_level"}:
+        await query.message.reply_text(
+            edit_field_prompt(field),
+            reply_markup=build_edit_value_keyboard(field),
+        )
+        return REVIEW_APPLICATION
+
+    context.user_data["editing_field"] = field
+    await query.message.reply_text(edit_field_prompt(field))
+    return EDIT_FIELD
+
+
+async def edit_value_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    _, field, key = query.data.split(":")
+    if field == "education":
+        context.user_data[field] = EDUCATION_LABELS[key]
+    elif field == "convicted":
+        context.user_data[field] = YES_NO_LABELS[key]
+    elif field in {"word_level", "excel_level"}:
+        context.user_data[field] = LEVEL_LABELS[key]
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text("✅ Ma'lumot yangilandi.")
+    await show_application_review(query.message, context)
+    return REVIEW_APPLICATION
+
+
+async def edit_field_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    field = context.user_data.get("editing_field")
+    if not field:
+        await show_application_review(update.message, context)
+        return REVIEW_APPLICATION
+
+    value = update.message.text.strip()
+    error = validate_edit_value(field, value)
+    if error:
+        await update.message.reply_text(error)
+        return EDIT_FIELD
+
+    if field == "birth_date":
+        context.user_data["birth_date"] = value
+        context.user_data["age"] = str(calculate_age(value))
+    elif field == "experience" and value.isdigit():
+        context.user_data[field] = f"{value} yil"
+    else:
+        context.user_data[field] = value
+
+    context.user_data.pop("editing_field", None)
+    await update.message.reply_text("✅ Ma'lumot yangilandi.")
+    await show_application_review(update.message, context)
+    return REVIEW_APPLICATION
+
+
+async def invalid_review_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await reply_to_update(
+        update,
+        "Iltimos, pastdagi tugmalardan birini tanlang.",
+        reply_markup=build_review_keyboard(),
+    )
+    return REVIEW_APPLICATION
+
+
+def edit_field_prompt(field: str) -> str:
+    prompts = {
+        "full_name": "Yangi ism-sharifni yozing.",
+        "birth_date": "Yangi tug'ilgan sanani yozing. Masalan: 29.10.2000",
+        "address": "Yangi yashash manzilini yozing.",
+        "branch": "Yangi filial shahar yoki tuman nomini yozing.",
+        "education": "Yangi ma'lumot darajasini tanlang.",
+        "experience": "Yangi tajribani yozing. Masalan: 3 yil",
+        "previous_job": "Oldingi ish joyi haqida yangi ma'lumot yozing.",
+        "convicted": "Sudlanganlik holatini tanlang.",
+        "family_status": "Oilaviy holatni qayta yozing.",
+        "previous_salary": "Oldingi maoshni qayta yozing.",
+        "expected_salary": "Kutilayotgan maoshni qayta yozing.",
+        "word_level": "Word darajasini tanlang.",
+        "excel_level": "Excel darajasini tanlang.",
+        "languages": "Tillarni qayta yozing.",
+        "fariks_duration": "Fariksda necha yil ishlash niyatingiz borligini yozing.",
+        "motivation": "Nima uchun Fariksda ishlashni xohlashingizni qayta yozing.",
+        "phone": "Yangi telefon raqamni yozing. Masalan: +998901234567",
+    }
+    return prompts.get(field, "Yangi qiymatni yozing.")
+
+
+def validate_edit_value(field: str, value: str) -> str | None:
+    if field == "full_name" and len(value) < 3:
+        return "Iltimos, ism-sharifingizni to'liq yozing."
+    if field == "birth_date" and not is_valid_birth_date(value):
+        return "Sanani to'g'ri yozing. Masalan: 29.10.2000"
+    if field == "address" and len(value) < 5:
+        return "Iltimos, manzilingizni to'liqroq yozing."
+    if field == "branch" and len(value) < 2:
+        return "Iltimos, filial shahar yoki tuman nomini yozing."
+    if field == "phone" and not phone_pattern.match(value):
+        return "Telefon raqamini to'g'ri formatda yuboring. Masalan: +998901234567"
+    if len(value) < 1:
+        return "Iltimos, qiymatni yozing."
+    return None
 
 
 async def recent_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -873,6 +1197,7 @@ def get_image_info(update: Update) -> dict | None:
         return {
             "type": "photo",
             "file_id": message.photo[-1].file_id,
+            "mime_type": "image/jpeg",
         }
 
     if message.document and message.document.mime_type:
@@ -880,6 +1205,8 @@ def get_image_info(update: Update) -> dict | None:
             return {
                 "type": "document",
                 "file_id": message.document.file_id,
+                "mime_type": message.document.mime_type,
+                "file_name": message.document.file_name,
             }
 
     return None
@@ -897,6 +1224,7 @@ async def finish_application(update: Update, context: ContextTypes.DEFAULT_TYPE)
     required_fields = [
         "full_name",
         "birth_date",
+        "age",
         "address",
         "branch",
         "education",
@@ -1033,10 +1361,11 @@ async def send_single_image(
 
 
 def build_application_caption(application: dict) -> str:
-    return (
+    text = (
         "🆕 Yangi nomzod\n\n"
         f"👤 Ism-sharif: {application['full_name']}\n"
         f"🎂 Tug'ilgan sana: {application['birth_date']}\n"
+        f"🔢 Yosh: {application['age']}\n"
         f"📍 Manzil: {application['address']}\n"
         f"🏢 Filial: {application['branch']}\n"
         f"🎓 Ma'lumot: {application['education']}\n"
@@ -1053,6 +1382,9 @@ def build_application_caption(application: dict) -> str:
         f"❓ Nega Fariks: {application['motivation']}\n"
         f"📞 Telefon: {application['phone']}"
     )
+    if application.get("reject_reason"):
+        text += f"\n📝 Rad sababi: {application['reject_reason']}"
+    return text
 
 
 def limit_telegram_text(text: str, limit: int = 3900) -> str:
@@ -1128,17 +1460,12 @@ async def handle_application_decision(
         )
         return
 
-    update_application_status(application_id, "rejected", admin_user.id)
-    await notify_user(
-        context,
-        application["user_id"],
-        "Arizangiz rad etildi. ❌",
-    )
+    admin_reject_targets[admin_user.id] = application_id
     await remove_decision_buttons(query)
-    await query.answer("Ariza rad etildi.")
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=f"❌ Ariza #{application_id} rad etildi.",
+    await query.answer("Rad etish sababini yozing.")
+    await query.message.reply_text(
+        f"❌ Ariza #{application_id} uchun rad etish sababini yozing.\n"
+        "Masalan: Tajriba yetarli emas.\n\nBekor qilish uchun /cancel.",
     )
 
 
@@ -1156,11 +1483,15 @@ async def notify_user(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: st
         logger.warning("Foydalanuvchiga xabar bormadi (%s): %s", user_id, format_runtime_error(error))
 
 
-def sync_excel_file() -> Path:
+def sync_excel_file(
+    rows: list[sqlite3.Row] | None = None,
+    image_paths: dict[int, Path] | None = None,
+) -> Path:
     EXCEL_FILE.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Arizalar"
+    image_paths = image_paths or {}
 
     headers = [
         "ID",
@@ -1170,6 +1501,7 @@ def sync_excel_file() -> Path:
         "Username",
         "Ism-sharif",
         "Tug'ilgan sana",
+        "Yosh",
         "Manzil",
         "Filial",
         "Ma'lumot",
@@ -1186,12 +1518,16 @@ def sync_excel_file() -> Path:
         "Nega Fariks",
         "Telefon",
         "Rasm file_id",
+        "Rasm",
+        "Rad sababi",
         "Qaror sanasi",
         "Qaror qilgan admin",
     ]
     sheet.append(headers)
+    image_column = headers.index("Rasm") + 1
+    application_rows = rows if rows is not None else get_all_application_rows()
 
-    for row in get_all_application_rows():
+    for row in application_rows:
         application = row_to_application(row)
         photo = application.get("recent_photo") or {}
         sheet.append(
@@ -1203,6 +1539,7 @@ def sync_excel_file() -> Path:
                 application["username"] or "",
                 application["full_name"],
                 application["birth_date"],
+                application["age"],
                 application["address"],
                 application["branch"],
                 application["education"],
@@ -1219,10 +1556,20 @@ def sync_excel_file() -> Path:
                 application["motivation"],
                 application["phone"],
                 photo.get("file_id", ""),
+                "Rasm bor" if image_paths.get(application["id"]) else "",
+                application["reject_reason"],
                 format_iso_datetime(application.get("decided_at") or ""),
                 application.get("decided_by") or "",
             ]
         )
+        row_number = sheet.max_row
+        image_path = image_paths.get(application["id"])
+        if image_path:
+            excel_image = ExcelImage(str(image_path))
+            excel_image.width = 90
+            excel_image.height = 90
+            sheet.add_image(excel_image, f"{get_column_letter(image_column)}{row_number}")
+            sheet.row_dimensions[row_number].height = 75
 
     for cell in sheet[1]:
         font = copy(cell.font)
@@ -1235,9 +1582,56 @@ def sync_excel_file() -> Path:
             45,
         )
         sheet.column_dimensions[get_column_letter(column[0].column)].width = width
+    sheet.column_dimensions[get_column_letter(image_column)].width = 16
 
     workbook.save(EXCEL_FILE)
     return EXCEL_FILE
+
+
+async def sync_excel_file_with_images(context: ContextTypes.DEFAULT_TYPE) -> Path:
+    rows = get_all_application_rows()
+    with TemporaryDirectory() as temp_dir:
+        image_paths = await download_excel_images(context, rows, Path(temp_dir))
+        return sync_excel_file(rows=rows, image_paths=image_paths)
+
+
+async def download_excel_images(
+    context: ContextTypes.DEFAULT_TYPE,
+    rows: list[sqlite3.Row],
+    temp_dir: Path,
+) -> dict[int, Path]:
+    image_paths: dict[int, Path] = {}
+
+    for row in rows:
+        application = row_to_application(row)
+        photo = application.get("recent_photo") or {}
+        file_id = photo.get("file_id")
+        if not file_id:
+            continue
+
+        original_path = temp_dir / f"app_{application['id']}_original"
+        thumbnail_path = temp_dir / f"app_{application['id']}.jpg"
+        try:
+            telegram_file = await context.bot.get_file(file_id)
+            await telegram_file.download_to_drive(custom_path=original_path)
+            resize_image_for_excel(original_path, thumbnail_path)
+            image_paths[application["id"]] = thumbnail_path
+        except Exception as error:
+            logger.warning(
+                "Excel uchun rasm yuklanmadi (#%s): %s",
+                application["id"],
+                format_runtime_error(error),
+            )
+
+    return image_paths
+
+
+def resize_image_for_excel(source_path: Path, target_path: Path) -> None:
+    with PILImage.open(source_path) as image:
+        image.thumbnail((160, 160))
+        if image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        image.save(target_path, format="JPEG", quality=82)
 
 
 def safe_sync_excel_file() -> Path | None:
@@ -1310,7 +1704,7 @@ async def admin_excel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.answer("Excel tayyorlanyapti...")
     try:
-        excel_path = sync_excel_file()
+        excel_path = await sync_excel_file_with_images(context)
     except Exception as error:
         logger.error("Excel yuborishda xatolik: %s", format_runtime_error(error))
         await query.message.reply_text(
@@ -1346,10 +1740,157 @@ def build_admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("➕ Admin qo'shish", callback_data="admin:add"),
                 InlineKeyboardButton("➖ Admin o'chirish", callback_data="admin:remove"),
             ],
-            [InlineKeyboardButton("📊 Excel", callback_data="admin:excel")],
+            [
+                InlineKeyboardButton("🟡 Kutilmoqda", callback_data="admin:list:pending"),
+                InlineKeyboardButton("✅ Tasdiqlangan", callback_data="admin:list:approved"),
+            ],
+            [
+                InlineKeyboardButton("❌ Rad etilgan", callback_data="admin:list:rejected"),
+                InlineKeyboardButton("🔎 Qidirish", callback_data="admin:search"),
+            ],
+            [
+                InlineKeyboardButton("🏢 Filial filter", callback_data="admin:filter_branch"),
+                InlineKeyboardButton("📊 Excel", callback_data="admin:excel"),
+            ],
             [InlineKeyboardButton("🔄 Yangilash", callback_data="admin:refresh")],
         ]
     )
+
+
+async def admin_status_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    upsert_user(query.from_user)
+
+    if not is_admin(query.from_user.id):
+        await query.answer("Bu bo'lim faqat adminlar uchun.", show_alert=True)
+        return
+
+    status = query.data.split(":")[-1]
+    rows = get_application_rows_by_status(status)
+    await query.answer()
+    await query.message.reply_text(
+        build_application_list_text(f"{status_label(status)} arizalar", rows),
+        reply_markup=build_application_list_keyboard(rows),
+    )
+
+
+async def admin_view_application_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    upsert_user(query.from_user)
+
+    if not is_admin(query.from_user.id):
+        await query.answer("Bu bo'lim faqat adminlar uchun.", show_alert=True)
+        return
+
+    application_id = int(query.data.split(":")[-1])
+    row = get_application(application_id)
+    if not row:
+        await query.answer("Ariza topilmadi.", show_alert=True)
+        return
+
+    application = row_to_application(row)
+    reply_markup = None
+    if application["status"] == "pending":
+        reply_markup = build_decision_keyboard(application["id"])
+
+    await query.answer()
+    await send_application_to_chat(
+        context=context,
+        chat_id=query.message.chat_id,
+        application=application,
+        reply_markup=reply_markup,
+    )
+
+
+async def admin_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    upsert_user(query.from_user)
+
+    if not is_admin(query.from_user.id):
+        await query.answer("Bu amal faqat adminlar uchun.", show_alert=True)
+        return
+
+    await query.answer()
+    admin_pending_actions[query.from_user.id] = SEARCH_APPLICATION_TARGET
+    await query.message.reply_text(
+        "🔎 Qidirish uchun ism, telefon raqam yoki filial nomini yozing.\n"
+        "Bekor qilish uchun /cancel.",
+    )
+
+
+async def admin_filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    upsert_user(query.from_user)
+
+    if not is_admin(query.from_user.id):
+        await query.answer("Bu amal faqat adminlar uchun.", show_alert=True)
+        return
+
+    await query.answer()
+    admin_pending_actions[query.from_user.id] = FILTER_BRANCH_TARGET
+    await query.message.reply_text(
+        "🏢 Qaysi filial bo'yicha filter qilamiz? Shahar yoki tuman nomini yozing.\n"
+        "Bekor qilish uchun /cancel.",
+    )
+
+
+async def admin_search_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_text = update.message.text.strip()
+    if len(query_text) < 2:
+        await update.message.reply_text("Qidirish uchun kamida 2 ta belgi yozing.")
+        return
+
+    rows = search_application_rows(query_text)
+    admin_pending_actions.pop(update.effective_user.id, None)
+    await update.message.reply_text(
+        build_application_list_text(f"Qidiruv: {query_text}", rows),
+        reply_markup=build_application_list_keyboard(rows),
+    )
+
+
+async def admin_filter_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    branch_text = update.message.text.strip()
+    if len(branch_text) < 2:
+        await update.message.reply_text("Filial uchun kamida 2 ta belgi yozing.")
+        return
+
+    rows = get_application_rows_by_branch(branch_text)
+    admin_pending_actions.pop(update.effective_user.id, None)
+    await update.message.reply_text(
+        build_application_list_text(f"Filial: {branch_text}", rows),
+        reply_markup=build_application_list_keyboard(rows),
+    )
+
+
+def build_application_list_text(title: str, rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return f"📭 {title}\n\nAriza topilmadi."
+
+    lines = [f"📋 {title}", ""]
+    for row in rows:
+        application = row_to_application(row)
+        lines.append(
+            f"#{application['id']} | {status_label(application['status'])} | "
+            f"{application['full_name']} | {application['branch']} | {application['phone']}"
+        )
+    lines.append("")
+    lines.append("Ko'rish uchun pastdagi tugmalardan birini bosing.")
+    return "\n".join(lines)
+
+
+def build_application_list_keyboard(rows: list[sqlite3.Row]) -> InlineKeyboardMarkup | None:
+    if not rows:
+        return None
+
+    buttons = []
+    for row in rows[:10]:
+        application = row_to_application(row)
+        name = application["full_name"][:22]
+        buttons.append(
+            [InlineKeyboardButton(f"👁 #{application['id']} {name}", callback_data=f"admin:view:{application['id']}")]
+        )
+    buttons.append([InlineKeyboardButton("🛠 Admin panel", callback_data="admin:refresh")])
+    return InlineKeyboardMarkup(buttons)
 
 
 async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1441,17 +1982,68 @@ async def admin_remove_receive(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     admin_pending_actions.pop(update.effective_user.id, None)
+    admin_reject_targets.pop(update.effective_user.id, None)
     await update.message.reply_text("Amal bekor qilindi.", reply_markup=ADMIN_MAIN_KEYBOARD)
     return ConversationHandler.END
 
 
 async def admin_pending_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id in admin_reject_targets:
+        await admin_reject_reason_receive(update, context)
+        return
+
     action = admin_pending_actions.get(update.effective_user.id)
     if action == ADD_ADMIN_TARGET:
         await admin_add_receive(update, context)
         return
     if action == REMOVE_ADMIN_TARGET:
         await admin_remove_receive(update, context)
+        return
+    if action == SEARCH_APPLICATION_TARGET:
+        await admin_search_receive(update, context)
+        return
+    if action == FILTER_BRANCH_TARGET:
+        await admin_filter_receive(update, context)
+
+
+async def admin_reject_reason_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        admin_reject_targets.pop(update.effective_user.id, None)
+        await update.message.reply_text("Bu amal faqat adminlar uchun.")
+        return
+
+    application_id = admin_reject_targets.get(update.effective_user.id)
+    reason = update.message.text.strip()
+    if len(reason) < 3:
+        await update.message.reply_text("Rad etish sababini to'liqroq yozing.")
+        return
+
+    row = get_application(application_id)
+    if not row:
+        admin_reject_targets.pop(update.effective_user.id, None)
+        await update.message.reply_text("Ariza topilmadi.", reply_markup=ADMIN_MAIN_KEYBOARD)
+        return
+
+    application = row_to_application(row)
+    if application["status"] != "pending":
+        admin_reject_targets.pop(update.effective_user.id, None)
+        await update.message.reply_text(
+            "Bu ariza allaqachon ko'rib chiqilgan.",
+            reply_markup=ADMIN_MAIN_KEYBOARD,
+        )
+        return
+
+    update_application_status(application_id, "rejected", update.effective_user.id, reason)
+    admin_reject_targets.pop(update.effective_user.id, None)
+    await notify_user(
+        context,
+        application["user_id"],
+        f"Arizangiz rad etildi. ❌\nSabab: {reason}",
+    )
+    await update.message.reply_text(
+        f"❌ Ariza #{application_id} rad etildi.\n📝 Sabab: {reason}",
+        reply_markup=ADMIN_MAIN_KEYBOARD,
+    )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1575,6 +2167,13 @@ def main() -> None:
             FARIKS_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, fariks_duration)],
             MOTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, motivation)],
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone)],
+            REVIEW_APPLICATION: [
+                CallbackQueryHandler(review_callback, pattern=r"^review:(confirm|edit|cancel)$"),
+                CallbackQueryHandler(edit_field_callback, pattern=r"^edit:[a-z_]+$"),
+                CallbackQueryHandler(edit_value_callback, pattern=r"^editval:(education|convicted|word_level|excel_level):[a-z]+$"),
+                MessageHandler(filters.ALL, invalid_review_input),
+            ],
+            EDIT_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_field_text)],
             RECENT_PHOTO: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, recent_photo),
                 MessageHandler(filters.ALL, invalid_recent_photo),
@@ -1593,6 +2192,10 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(admin_add_start, pattern=r"^admin:add$"))
     application.add_handler(CallbackQueryHandler(admin_remove_start, pattern=r"^admin:remove$"))
     application.add_handler(CallbackQueryHandler(admin_excel_callback, pattern=r"^admin:excel$"))
+    application.add_handler(CallbackQueryHandler(admin_status_list_callback, pattern=r"^admin:list:(pending|approved|rejected)$"))
+    application.add_handler(CallbackQueryHandler(admin_view_application_callback, pattern=r"^admin:view:\d+$"))
+    application.add_handler(CallbackQueryHandler(admin_search_start, pattern=r"^admin:search$"))
+    application.add_handler(CallbackQueryHandler(admin_filter_start, pattern=r"^admin:filter_branch$"))
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern=r"^admin:refresh$"))
     application.add_handler(CommandHandler("myid", my_id))
     application.add_handler(CommandHandler("cancel", admin_cancel))

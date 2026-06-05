@@ -6,7 +6,6 @@ import sqlite3
 import sys
 import time
 import warnings
-from copy import copy
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,6 +13,7 @@ from tempfile import TemporaryDirectory
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
 from telegram import (
@@ -235,6 +235,7 @@ def init_db() -> None:
                 certificate_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 reject_reason TEXT NOT NULL DEFAULT '',
+                admin_messages_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL,
                 decided_at TEXT,
                 decided_by INTEGER
@@ -267,6 +268,7 @@ def init_db() -> None:
                 "certificates_json": "TEXT NOT NULL DEFAULT '[]'",
                 "certificate_count": "INTEGER NOT NULL DEFAULT 0",
                 "reject_reason": "TEXT NOT NULL DEFAULT ''",
+                "admin_messages_json": "TEXT NOT NULL DEFAULT '[]'",
             },
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(username_lower)")
@@ -355,6 +357,28 @@ def get_stats() -> dict:
         "approved": approved,
         "rejected": rejected,
     }
+
+
+def get_db_admin_ids() -> set[int]:
+    with db_connect() as connection:
+        return {row["user_id"] for row in connection.execute("SELECT user_id FROM admins")}
+
+
+def get_all_admin_ids() -> set[int]:
+    return ADMIN_IDS | get_db_admin_ids()
+
+
+def get_admin_delivery_chat_ids() -> list[str]:
+    chat_ids: list[str] = []
+    if ADMIN_CHAT_ID:
+        chat_ids.append(str(ADMIN_CHAT_ID))
+
+    for admin_id in sorted(get_all_admin_ids()):
+        admin_chat_id = str(admin_id)
+        if admin_chat_id not in chat_ids:
+            chat_ids.append(admin_chat_id)
+
+    return chat_ids
 
 
 def find_user_by_username(username: str) -> dict | None:
@@ -533,12 +557,14 @@ def delete_application(application_id: int) -> None:
     safe_sync_excel_file()
 
 
-def update_application_status(
+def set_application_status(
     application_id: int,
     status: str,
     admin_id: int,
     reject_reason: str = "",
 ) -> None:
+    decided_at = None if status == "pending" else now_iso()
+    decided_by = None if status == "pending" else admin_id
     with db_connect() as connection:
         connection.execute(
             """
@@ -546,9 +572,51 @@ def update_application_status(
             SET status = ?, decided_at = ?, decided_by = ?, reject_reason = ?
             WHERE id = ?
             """,
-            (status, now_iso(), admin_id, reject_reason, application_id),
+            (status, decided_at, decided_by, reject_reason, application_id),
         )
     safe_sync_excel_file()
+
+
+def try_update_application_status(
+    application_id: int,
+    expected_status: str,
+    status: str,
+    admin_id: int,
+    reject_reason: str = "",
+) -> bool:
+    with db_connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE applications
+            SET status = ?, decided_at = ?, decided_by = ?, reject_reason = ?
+            WHERE id = ? AND status = ?
+            """,
+            (status, now_iso(), admin_id, reject_reason, application_id, expected_status),
+        )
+        updated = cursor.rowcount > 0
+
+    if updated:
+        safe_sync_excel_file()
+    return updated
+
+
+def save_application_admin_messages(application_id: int, messages: list[dict]) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            "UPDATE applications SET admin_messages_json = ? WHERE id = ?",
+            (json.dumps(messages, ensure_ascii=False), application_id),
+        )
+
+
+def get_application_admin_messages(application_id: int) -> list[dict]:
+    row = get_application(application_id)
+    if not row:
+        return []
+    row_data = dict(row)
+    try:
+        return json.loads(row_data.get("admin_messages_json") or "[]")
+    except json.JSONDecodeError:
+        return []
 
 
 def row_to_application(row: sqlite3.Row | dict) -> dict:
@@ -1290,15 +1358,37 @@ async def send_application_to_admin(
     context: ContextTypes.DEFAULT_TYPE,
     application: dict,
 ) -> None:
-    if not ADMIN_CHAT_ID:
+    chat_ids = get_admin_delivery_chat_ids()
+    if not chat_ids:
         raise RuntimeError("ADMIN_CHAT_ID .env faylida ko'rsatilmagan.")
 
-    await send_application_to_chat(
-        context=context,
-        chat_id=ADMIN_CHAT_ID,
-        application=application,
-        reply_markup=build_decision_keyboard(application["id"]),
-    )
+    admin_messages = []
+    for chat_id in chat_ids:
+        try:
+            sent_messages = await send_application_to_chat(
+                context=context,
+                chat_id=chat_id,
+                application=application,
+                reply_markup=build_decision_keyboard(application["id"]),
+            )
+            admin_messages.extend(
+                {
+                    "chat_id": str(message.chat_id),
+                    "message_id": message.message_id,
+                }
+                for message in sent_messages
+            )
+        except Exception as error:
+            logger.warning(
+                "Adminga yuborilmadi (%s): %s",
+                chat_id,
+                format_runtime_error(error),
+            )
+
+    if not admin_messages:
+        raise RuntimeError("Arizani birorta adminga yuborib bo'lmadi.")
+
+    save_application_admin_messages(application["id"], admin_messages)
 
 
 async def send_application_to_chat(
@@ -1306,34 +1396,35 @@ async def send_application_to_chat(
     chat_id: str,
     application: dict,
     reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
+) -> list:
     caption = build_application_caption(application)
     image = application.get("recent_photo") or {}
 
     if not image:
-        await context.bot.send_message(
+        message = await context.bot.send_message(
             chat_id=chat_id,
             text=limit_telegram_text(caption),
             reply_markup=reply_markup,
         )
-        return
+        return [message]
 
     if len(caption) <= 1024:
-        await send_single_image(
+        message = await send_single_image(
             context=context,
             chat_id=chat_id,
             image=image,
             caption=caption,
             reply_markup=reply_markup,
         )
-        return
+        return [message]
 
-    await send_single_image(context=context, chat_id=chat_id, image=image, caption=None)
-    await context.bot.send_message(
+    image_message = await send_single_image(context=context, chat_id=chat_id, image=image, caption=None)
+    text_message = await context.bot.send_message(
         chat_id=chat_id,
         text=limit_telegram_text(caption),
         reply_markup=reply_markup,
     )
+    return [image_message, text_message]
 
 
 async def send_single_image(
@@ -1342,17 +1433,16 @@ async def send_single_image(
     image: dict,
     caption: str | None,
     reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
+):
     if image.get("type") == "photo":
-        await context.bot.send_photo(
+        return await context.bot.send_photo(
             chat_id=chat_id,
             photo=image["file_id"],
             caption=caption,
             reply_markup=reply_markup,
         )
-        return
 
-    await context.bot.send_document(
+    return await context.bot.send_document(
         chat_id=chat_id,
         document=image["file_id"],
         caption=caption,
@@ -1426,13 +1516,31 @@ async def handle_application_decision(
 
     application = row_to_application(row)
     if application["status"] != "pending":
-        await query.answer("Bu ariza allaqachon ko'rib chiqilgan.", show_alert=True)
+        await query.answer(
+            f"Bu ariza allaqachon {status_label(application['status']).lower()}.",
+            show_alert=True,
+        )
         await remove_decision_buttons(query)
         return
 
     if action == "approve":
         if not PUBLISH_CHAT_ID:
             await query.answer("PUBLISH_CHAT_ID sozlanmagan.", show_alert=True)
+            return
+
+        locked = try_update_application_status(
+            application_id,
+            expected_status="pending",
+            status="processing",
+            admin_id=admin_user.id,
+        )
+        if not locked:
+            fresh_application = row_to_application(get_application(application_id))
+            await query.answer(
+                f"Bu ariza allaqachon {status_label(fresh_application['status']).lower()}.",
+                show_alert=True,
+            )
+            await remove_decision_buttons(query)
             return
 
         try:
@@ -1442,22 +1550,21 @@ async def handle_application_decision(
                 application=application,
             )
         except Exception as error:
+            set_application_status(application_id, "pending", admin_user.id)
             logger.error("Kanalga yuborishda xatolik: %s", format_runtime_error(error))
             await query.answer("Kanalga yuborishda xatolik bo'ldi.", show_alert=True)
             return
 
-        update_application_status(application_id, "approved", admin_user.id)
+        set_application_status(application_id, "approved", admin_user.id)
+        approved_application = row_to_application(get_application(application_id))
         await notify_user(
             context,
             application["user_id"],
             "Arizangiz tasdiqlandi. Siz bilan yaqinda bog'lanamiz. ✅",
         )
-        await remove_decision_buttons(query)
+        await remove_decision_buttons_from_admin_messages(context, application_id)
+        await notify_admins_about_decision(context, approved_application, admin_user, "approved")
         await query.answer("Ariza tasdiqlandi.")
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"✅ Ariza #{application_id} tasdiqlandi.",
-        )
         return
 
     admin_reject_targets[admin_user.id] = application_id
@@ -1476,6 +1583,50 @@ async def remove_decision_buttons(query) -> None:
         logger.warning("Inline tugmalarni o'chirishda xatolik: %s", format_runtime_error(error))
 
 
+async def remove_decision_buttons_from_admin_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    application_id: int,
+) -> None:
+    for message in get_application_admin_messages(application_id):
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=message["chat_id"],
+                message_id=message["message_id"],
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+
+async def notify_admins_about_decision(
+    context: ContextTypes.DEFAULT_TYPE,
+    application: dict,
+    admin_user,
+    status: str,
+    reason: str = "",
+) -> None:
+    admin_name = f"@{admin_user.username}" if admin_user.username else str(admin_user.id)
+    if status == "approved":
+        text = (
+            f"✅ Ariza #{application['id']} tasdiqlandi.\n"
+            f"👮 Qaror qilgan admin: {admin_name}\n"
+            f"👤 Nomzod: {application['full_name']}"
+        )
+    else:
+        text = (
+            f"❌ Ariza #{application['id']} rad etildi.\n"
+            f"👮 Qaror qilgan admin: {admin_name}\n"
+            f"👤 Nomzod: {application['full_name']}\n"
+            f"📝 Sabab: {reason}"
+        )
+
+    for chat_id in get_admin_delivery_chat_ids():
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            pass
+
+
 async def notify_user(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str) -> None:
     try:
         await context.bot.send_message(chat_id=user_id, text=text)
@@ -1491,6 +1642,7 @@ def sync_excel_file(
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Arizalar"
+    sheet.sheet_view.showGridLines = False
     image_paths = image_paths or {}
 
     headers = [
@@ -1517,19 +1669,31 @@ def sync_excel_file(
         "Fariksda ishlash niyati",
         "Nega Fariks",
         "Telefon",
-        "Rasm file_id",
         "Rasm",
         "Rad sababi",
         "Qaror sanasi",
         "Qaror qilgan admin",
     ]
+    last_column = get_column_letter(len(headers))
+    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    sheet["A1"] = "Fariks ishga arizalar"
+    sheet["A1"].font = Font(bold=True, color="FFFFFF", size=16)
+    sheet["A1"].fill = PatternFill("solid", fgColor="1F4E78")
+    sheet["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    sheet.row_dimensions[1].height = 28
+
+    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
+    sheet["A2"] = f"Yaratilgan vaqt: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    sheet["A2"].font = Font(italic=True, color="666666")
+    sheet["A2"].alignment = Alignment(horizontal="right")
+
     sheet.append(headers)
     image_column = headers.index("Rasm") + 1
     application_rows = rows if rows is not None else get_all_application_rows()
+    header_row = 3
 
     for row in application_rows:
         application = row_to_application(row)
-        photo = application.get("recent_photo") or {}
         sheet.append(
             [
                 application["id"],
@@ -1555,8 +1719,7 @@ def sync_excel_file(
                 application["fariks_duration"],
                 application["motivation"],
                 application["phone"],
-                photo.get("file_id", ""),
-                "Rasm bor" if image_paths.get(application["id"]) else "",
+                "" if image_paths.get(application["id"]) else "Rasm yo'q",
                 application["reject_reason"],
                 format_iso_datetime(application.get("decided_at") or ""),
                 application.get("decided_by") or "",
@@ -1571,21 +1734,82 @@ def sync_excel_file(
             sheet.add_image(excel_image, f"{get_column_letter(image_column)}{row_number}")
             sheet.row_dimensions[row_number].height = 75
 
-    for cell in sheet[1]:
-        font = copy(cell.font)
-        font.bold = True
-        cell.font = font
+    apply_excel_design(sheet, headers, header_row, image_column)
 
-    for column in sheet.columns:
-        width = min(
-            max(len(str(cell.value or "")) for cell in column) + 2,
-            45,
-        )
-        sheet.column_dimensions[get_column_letter(column[0].column)].width = width
-    sheet.column_dimensions[get_column_letter(image_column)].width = 16
+    sheet.freeze_panes = "A4"
+    sheet.auto_filter.ref = f"A{header_row}:{last_column}{sheet.max_row}"
 
     workbook.save(EXCEL_FILE)
     return EXCEL_FILE
+
+
+def apply_excel_design(sheet, headers: list[str], header_row: int, image_column: int) -> None:
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin_side = Side(style="thin", color="D9E2F3")
+    border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    odd_fill = PatternFill("solid", fgColor="F8FBFF")
+    even_fill = PatternFill("solid", fgColor="FFFFFF")
+    status_fills = {
+        "Kutilmoqda": PatternFill("solid", fgColor="FFF2CC"),
+        "Tasdiqlangan": PatternFill("solid", fgColor="D9EAD3"),
+        "Rad etilgan": PatternFill("solid", fgColor="F4CCCC"),
+        "Ko'rib chiqilmoqda": PatternFill("solid", fgColor="D9EAF7"),
+    }
+
+    for cell in sheet[header_row]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+    sheet.row_dimensions[header_row].height = 32
+
+    status_column = headers.index("Holat") + 1
+    for row_number in range(header_row + 1, sheet.max_row + 1):
+        row_fill = odd_fill if row_number % 2 else even_fill
+        for cell in sheet[row_number]:
+            cell.fill = row_fill
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+        status_cell = sheet.cell(row=row_number, column=status_column)
+        if status_cell.value in status_fills:
+            status_cell.fill = status_fills[status_cell.value]
+            status_cell.font = Font(bold=True)
+            status_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    width_by_header = {
+        "ID": 8,
+        "Sana": 18,
+        "Holat": 18,
+        "Telegram ID": 16,
+        "Username": 18,
+        "Ism-sharif": 28,
+        "Tug'ilgan sana": 16,
+        "Yosh": 8,
+        "Manzil": 34,
+        "Filial": 24,
+        "Ma'lumot": 20,
+        "Soha tajribasi": 20,
+        "Oldingi ish joyi": 32,
+        "Sudlangan": 14,
+        "Oilaviy holati": 32,
+        "Oldingi maosh": 18,
+        "Kutilayotgan maosh": 22,
+        "Word": 14,
+        "Excel": 14,
+        "Tillar": 24,
+        "Fariksda ishlash niyati": 22,
+        "Nega Fariks": 36,
+        "Telefon": 20,
+        "Rasm": 16,
+        "Rad sababi": 32,
+        "Qaror sanasi": 18,
+        "Qaror qilgan admin": 20,
+    }
+    for index, header in enumerate(headers, start=1):
+        sheet.column_dimensions[get_column_letter(index)].width = width_by_header.get(header, 18)
+    sheet.column_dimensions[get_column_letter(image_column)].width = 16
 
 
 async def sync_excel_file_with_images(context: ContextTypes.DEFAULT_TYPE) -> Path:
@@ -1645,6 +1869,7 @@ def safe_sync_excel_file() -> Path | None:
 def status_label(status: str) -> str:
     return {
         "pending": "Kutilmoqda",
+        "processing": "Ko'rib chiqilmoqda",
         "approved": "Tasdiqlangan",
         "rejected": "Rad etilgan",
     }.get(status, status)
@@ -2028,17 +2253,41 @@ async def admin_reject_reason_receive(update: Update, context: ContextTypes.DEFA
     if application["status"] != "pending":
         admin_reject_targets.pop(update.effective_user.id, None)
         await update.message.reply_text(
-            "Bu ariza allaqachon ko'rib chiqilgan.",
+            f"Bu ariza allaqachon {status_label(application['status']).lower()}.",
             reply_markup=ADMIN_MAIN_KEYBOARD,
         )
         return
 
-    update_application_status(application_id, "rejected", update.effective_user.id, reason)
+    decided = try_update_application_status(
+        application_id,
+        expected_status="pending",
+        status="rejected",
+        admin_id=update.effective_user.id,
+        reject_reason=reason,
+    )
     admin_reject_targets.pop(update.effective_user.id, None)
+    if not decided:
+        fresh_row = get_application(application_id)
+        fresh_application = row_to_application(fresh_row) if fresh_row else application
+        await update.message.reply_text(
+            f"Bu ariza allaqachon {status_label(fresh_application['status']).lower()}.",
+            reply_markup=ADMIN_MAIN_KEYBOARD,
+        )
+        return
+
+    rejected_application = row_to_application(get_application(application_id))
     await notify_user(
         context,
         application["user_id"],
         f"Arizangiz rad etildi. ❌\nSabab: {reason}",
+    )
+    await remove_decision_buttons_from_admin_messages(context, application_id)
+    await notify_admins_about_decision(
+        context,
+        rejected_application,
+        update.effective_user,
+        "rejected",
+        reason,
     )
     await update.message.reply_text(
         f"❌ Ariza #{application_id} rad etildi.\n📝 Sabab: {reason}",

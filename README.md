@@ -20,10 +20,13 @@ joyda ishlayapti. Kompyuterdagi eski `python main.py` jarayonini to'xtating yoki
 replica sonini 1 taga tushiring.
 
 Admin paneldagi `📊 Excel` tugmasi barcha arizalarni `.xlsx` fayl ko'rinishida yuboradi.
-Excel eksportida nomzod rasmi ham jadval ichida ko'rinadi.
+Excel eksportida nomzod rasmi ham jadval ichida ko'rinadi, Telegram `file_id`
+qiymati Excelga yozilmaydi.
 
 Admin panelda arizalarni status bo'yicha ko'rish, ism/telefon/filial bo'yicha qidirish,
 filial bo'yicha filter qilish va rad etishda sabab yozish imkoniyati bor.
+Bir arizani faqat bitta admin yakunlay oladi: kim birinchi tasdiqlasa yoki rad etsa,
+qolgan adminlardagi inline tugmalar ishlamaydi va qaror haqida xabar boradi.
 
 Foydalanuvchi tug'ilgan sanani kiritadi, bot yoshni avtomatik hisoblaydi. Rasm yuborishdan
 oldin ariza ma'lumotlarini tekshirib, kerak bo'lsa tahrirlashi mumkin.

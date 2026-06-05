@@ -1,4 +1,5 @@
 .env
 bot.db
+*.xlsx
 __pycache__/
 .venv/

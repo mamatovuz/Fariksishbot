@@ -6,15 +6,16 @@ import sqlite3
 import sys
 import time
 import warnings
+from copy import copy
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaDocument,
-    InputMediaPhoto,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
@@ -38,6 +39,7 @@ DEFAULT_ADMIN_IDS = "7903688837"
 DEFAULT_ADMIN_CHAT_ID = "7903688837"
 DEFAULT_PUBLISH_CHAT_ID = "-1003994819171"
 DEFAULT_DB_FILE = "bot.db"
+DEFAULT_EXCEL_FILE = "applications.xlsx"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or DEFAULT_BOT_TOKEN
 ADMIN_IDS_TEXT = os.getenv("ADMIN_IDS") or DEFAULT_ADMIN_IDS
@@ -53,14 +55,50 @@ ADMIN_IDS = {
     if admin_id.strip().lstrip("-").isdigit()
 }
 DB_FILE = Path(os.getenv("DB_FILE") or DEFAULT_DB_FILE)
+EXCEL_FILE = Path(os.getenv("EXCEL_FILE") or DEFAULT_EXCEL_FILE)
 
-FULL_NAME, PHONE, AGE, ROLE_CHOICE, DIRECTION, LANGUAGES, EXPERIENCE_CHOICE, EXPERIENCE_YEARS, CERTIFICATES = range(9)
+(
+    FULL_NAME,
+    BIRTH_DATE,
+    ADDRESS,
+    BRANCH,
+    EDUCATION,
+    EXPERIENCE_CHOICE,
+    EXPERIENCE_YEARS,
+    PREVIOUS_JOB,
+    CONVICTED,
+    FAMILY_STATUS,
+    PREVIOUS_SALARY,
+    EXPECTED_SALARY,
+    WORD_LEVEL,
+    EXCEL_LEVEL,
+    LANGUAGES,
+    FARIKS_DURATION,
+    MOTIVATION,
+    PHONE,
+    RECENT_PHOTO,
+) = range(19)
 ADD_ADMIN_TARGET, REMOVE_ADMIN_TARGET = range(100, 102)
 
-ROLE_KEYBOARD = InlineKeyboardMarkup(
+EDUCATION_LABELS = {
+    "higher": "Oliy ma'lumotli",
+    "secondary": "O'rta maxsus",
+}
+LEVEL_LABELS = {
+    "unknown": "Bilmayman",
+    "basic": "Bazaviy",
+    "medium": "O'rtacha",
+    "good": "Yaxshi",
+}
+YES_NO_LABELS = {
+    "yes": "Ha",
+    "no": "Yo'q",
+}
+
+EDUCATION_KEYBOARD = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("🛠 Admin / Support", callback_data="role:admin")],
-        [InlineKeyboardButton("👨‍🏫 O'qituvchi", callback_data="role:teacher")],
+        [InlineKeyboardButton("🎓 Oliy ma'lumotli", callback_data="education:higher")],
+        [InlineKeyboardButton("🏥 O'rta maxsus", callback_data="education:secondary")],
     ]
 )
 EXPERIENCE_INLINE_KEYBOARD = InlineKeyboardMarkup(
@@ -71,9 +109,37 @@ EXPERIENCE_INLINE_KEYBOARD = InlineKeyboardMarkup(
         ]
     ]
 )
-CERTIFICATE_KEYBOARD = ReplyKeyboardMarkup(
-    [["✅ Tugatildi", "⏭ Skip"]],
-    resize_keyboard=True,
+CONVICTED_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("✅ Ha", callback_data="convicted:yes"),
+            InlineKeyboardButton("❌ Yo'q", callback_data="convicted:no"),
+        ]
+    ]
+)
+WORD_LEVEL_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("❌ Bilmayman", callback_data="word:unknown"),
+            InlineKeyboardButton("🔹 Bazaviy", callback_data="word:basic"),
+        ],
+        [
+            InlineKeyboardButton("🔸 O'rtacha", callback_data="word:medium"),
+            InlineKeyboardButton("✅ Yaxshi", callback_data="word:good"),
+        ],
+    ]
+)
+EXCEL_LEVEL_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("❌ Bilmayman", callback_data="excel:unknown"),
+            InlineKeyboardButton("🔹 Bazaviy", callback_data="excel:basic"),
+        ],
+        [
+            InlineKeyboardButton("🔸 O'rtacha", callback_data="excel:medium"),
+            InlineKeyboardButton("✅ Yaxshi", callback_data="excel:good"),
+        ],
+    ]
 )
 ADMIN_MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [["📝 Ariza yuborish"], ["🛠 Admin panel"]],
@@ -138,15 +204,29 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 username TEXT,
-                role TEXT NOT NULL DEFAULT 'teacher',
                 full_name TEXT NOT NULL,
+                birth_date TEXT NOT NULL DEFAULT '',
+                address TEXT NOT NULL DEFAULT '',
+                branch TEXT NOT NULL DEFAULT '',
+                education TEXT NOT NULL DEFAULT '',
                 phone TEXT NOT NULL,
-                age TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                languages TEXT NOT NULL DEFAULT '',
                 experience TEXT NOT NULL,
-                certificates_json TEXT NOT NULL,
-                certificate_count INTEGER NOT NULL,
+                previous_job TEXT NOT NULL DEFAULT '',
+                convicted TEXT NOT NULL DEFAULT '',
+                family_status TEXT NOT NULL DEFAULT '',
+                previous_salary TEXT NOT NULL DEFAULT '',
+                expected_salary TEXT NOT NULL DEFAULT '',
+                word_level TEXT NOT NULL DEFAULT '',
+                excel_level TEXT NOT NULL DEFAULT '',
+                languages TEXT NOT NULL DEFAULT '',
+                fariks_duration TEXT NOT NULL DEFAULT '',
+                motivation TEXT NOT NULL DEFAULT '',
+                recent_photo_json TEXT NOT NULL DEFAULT '{}',
+                role TEXT NOT NULL DEFAULT 'employee',
+                age TEXT NOT NULL DEFAULT '',
+                direction TEXT NOT NULL DEFAULT '',
+                certificates_json TEXT NOT NULL DEFAULT '[]',
+                certificate_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 decided_at TEXT,
@@ -160,8 +240,25 @@ def init_db() -> None:
             connection,
             "applications",
             {
-                "role": "TEXT NOT NULL DEFAULT 'teacher'",
-                "languages": "TEXT NOT NULL DEFAULT ''",
+                "birth_date": "TEXT NOT NULL DEFAULT ''",
+                "address": "TEXT NOT NULL DEFAULT ''",
+                "branch": "TEXT NOT NULL DEFAULT ''",
+                "education": "TEXT NOT NULL DEFAULT ''",
+                "previous_job": "TEXT NOT NULL DEFAULT ''",
+                "convicted": "TEXT NOT NULL DEFAULT ''",
+                "family_status": "TEXT NOT NULL DEFAULT ''",
+                "previous_salary": "TEXT NOT NULL DEFAULT ''",
+                "expected_salary": "TEXT NOT NULL DEFAULT ''",
+                "word_level": "TEXT NOT NULL DEFAULT ''",
+                "excel_level": "TEXT NOT NULL DEFAULT ''",
+                "fariks_duration": "TEXT NOT NULL DEFAULT ''",
+                "motivation": "TEXT NOT NULL DEFAULT ''",
+                "recent_photo_json": "TEXT NOT NULL DEFAULT '{}'",
+                "role": "TEXT NOT NULL DEFAULT 'employee'",
+                "age": "TEXT NOT NULL DEFAULT ''",
+                "direction": "TEXT NOT NULL DEFAULT ''",
+                "certificates_json": "TEXT NOT NULL DEFAULT '[]'",
+                "certificate_count": "INTEGER NOT NULL DEFAULT 0",
             },
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(username_lower)")
@@ -318,7 +415,7 @@ def resolve_admin_target(text: str) -> tuple[int | None, str | None, str | None]
     return None, None, "Username @ bilan yoki Telegram ID raqam ko'rinishida yuboring."
 
 
-def get_application(application_id: int) -> dict | None:
+def get_application(application_id: int) -> sqlite3.Row | None:
     with db_connect() as connection:
         return connection.execute(
             "SELECT * FROM applications WHERE id = ?",
@@ -326,38 +423,60 @@ def get_application(application_id: int) -> dict | None:
         ).fetchone()
 
 
+def get_all_application_rows() -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        return list(connection.execute("SELECT * FROM applications ORDER BY id"))
+
+
 def create_application(user, user_data: dict) -> int:
-    certificates = user_data.get("certificates", [])
+    photo = user_data.get("recent_photo", {})
     with db_connect() as connection:
         cursor = connection.execute(
             """
             INSERT INTO applications (
-                user_id, username, role, full_name, phone, age, direction, languages,
-                experience, certificates_json, certificate_count, status, created_at
+                user_id, username, full_name, birth_date, address, branch, education,
+                phone, experience, previous_job, convicted, family_status,
+                previous_salary, expected_salary, word_level, excel_level, languages,
+                fariks_duration, motivation, recent_photo_json, role, age, direction,
+                certificates_json, certificate_count, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'employee', '', ?, '[]', 0, 'pending', ?)
             """,
             (
                 user.id,
                 user.username,
-                user_data["role"],
                 user_data["full_name"],
+                user_data["birth_date"],
+                user_data["address"],
+                user_data["branch"],
+                user_data["education"],
                 user_data["phone"],
-                user_data["age"],
-                user_data["direction"],
-                user_data.get("languages", ""),
                 user_data["experience"],
-                json.dumps(certificates, ensure_ascii=False),
-                len(certificates),
+                user_data["previous_job"],
+                user_data["convicted"],
+                user_data["family_status"],
+                user_data["previous_salary"],
+                user_data["expected_salary"],
+                user_data["word_level"],
+                user_data["excel_level"],
+                user_data["languages"],
+                user_data["fariks_duration"],
+                user_data["motivation"],
+                json.dumps(photo, ensure_ascii=False),
+                user_data["branch"],
                 now_iso(),
             ),
         )
-        return cursor.lastrowid
+        application_id = cursor.lastrowid
+
+    safe_sync_excel_file()
+    return application_id
 
 
 def delete_application(application_id: int) -> None:
     with db_connect() as connection:
         connection.execute("DELETE FROM applications WHERE id = ?", (application_id,))
+    safe_sync_excel_file()
 
 
 def update_application_status(application_id: int, status: str, admin_id: int) -> None:
@@ -370,24 +489,37 @@ def update_application_status(application_id: int, status: str, admin_id: int) -
             """,
             (status, now_iso(), admin_id, application_id),
         )
+    safe_sync_excel_file()
 
 
-def row_to_application(row: dict) -> dict:
+def row_to_application(row: sqlite3.Row | dict) -> dict:
     row_data = dict(row)
     return {
         "id": row_data["id"],
         "user_id": row_data["user_id"],
         "username": row_data.get("username"),
-        "role": row_data.get("role", "teacher"),
-        "full_name": row_data["full_name"],
-        "phone": row_data["phone"],
-        "age": row_data["age"],
-        "direction": row_data.get("direction", ""),
+        "full_name": row_data.get("full_name", ""),
+        "birth_date": row_data.get("birth_date", ""),
+        "address": row_data.get("address", ""),
+        "branch": row_data.get("branch", "") or row_data.get("direction", ""),
+        "education": row_data.get("education", ""),
+        "phone": row_data.get("phone", ""),
+        "experience": row_data.get("experience", ""),
+        "previous_job": row_data.get("previous_job", ""),
+        "convicted": row_data.get("convicted", ""),
+        "family_status": row_data.get("family_status", ""),
+        "previous_salary": row_data.get("previous_salary", ""),
+        "expected_salary": row_data.get("expected_salary", ""),
+        "word_level": row_data.get("word_level", ""),
+        "excel_level": row_data.get("excel_level", ""),
         "languages": row_data.get("languages", ""),
-        "experience": row_data["experience"],
-        "certificates": json.loads(row_data.get("certificates_json") or "[]"),
-        "certificate_count": row_data.get("certificate_count", 0),
-        "status": row_data["status"],
+        "fariks_duration": row_data.get("fariks_duration", ""),
+        "motivation": row_data.get("motivation", ""),
+        "recent_photo": json.loads(row_data.get("recent_photo_json") or "{}"),
+        "status": row_data.get("status", ""),
+        "created_at": row_data.get("created_at", ""),
+        "decided_at": row_data.get("decided_at", ""),
+        "decided_by": row_data.get("decided_by", ""),
     }
 
 
@@ -412,133 +544,101 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def begin_application(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     upsert_user(update.effective_user)
-
     context.user_data.clear()
-    context.user_data["certificates"] = []
 
     await update.message.reply_text(
         "Assalomu alaykum! 👋\n"
-        "Fariks Aloqa jamoasiga ariza yuborish uchun savollarga javob bering.",
+        "Fariks jamoasiga ishga ariza topshirish uchun savollarga javob bering.",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await update.message.reply_text("👤 Ism va familiyangizni kiriting.")
+    await update.message.reply_text("1. 👤 Ism-sharifingizni yozing.")
     return FULL_NAME
 
 
 async def full_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     if len(name) < 3:
-        await update.message.reply_text("Iltimos, ism va familiyangizni to'liq kiriting.")
+        await update.message.reply_text("Iltimos, ism-sharifingizni to'liq yozing.")
         return FULL_NAME
 
     context.user_data["full_name"] = name
-    await update.message.reply_text("📞 Telefon raqamingizni yuboring. Masalan: +998901234567")
-    return PHONE
-
-
-async def phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    phone_number = update.message.text.strip()
-    if not phone_pattern.match(phone_number):
-        await update.message.reply_text(
-            "Telefon raqamini to'g'ri formatda yuboring. Masalan: +998901234567"
-        )
-        return PHONE
-
-    context.user_data["phone"] = phone_number
-    await update.message.reply_text("🎂 Yoshingiz nechida?")
-    return AGE
-
-
-async def age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    age_text = update.message.text.strip()
-    if not age_text.isdigit() or not 1 <= int(age_text) <= 120:
-        await update.message.reply_text("Iltimos, yoshingizni raqam bilan kiriting.")
-        return AGE
-
-    context.user_data["age"] = age_text
     await update.message.reply_text(
-        "🚩 Qaysi yo'nalish bo'yicha ariza topshirmoqchisiz?",
-        reply_markup=ROLE_KEYBOARD,
+        "2. 🎂 Tug'ilgan kun, oy va yilingizni yozing.\nMasalan: 29.10.2000"
     )
-    return ROLE_CHOICE
+    return BIRTH_DATE
 
 
-async def role_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if not is_valid_birth_date(value):
+        await update.message.reply_text("Sanani to'g'ri yozing. Masalan: 29.10.2000")
+        return BIRTH_DATE
+
+    context.user_data["birth_date"] = value
+    await update.message.reply_text("3. 📍 Yashash manzilingizni to'liq yozing.")
+    return ADDRESS
+
+
+def is_valid_birth_date(value: str) -> bool:
+    try:
+        parsed = datetime.strptime(value, "%d.%m.%Y")
+    except ValueError:
+        return False
+    return datetime(1940, 1, 1) <= parsed <= datetime.now()
+
+
+async def address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if len(value) < 5:
+        await update.message.reply_text("Iltimos, manzilingizni to'liqroq yozing.")
+        return ADDRESS
+
+    context.user_data["address"] = value
+    await update.message.reply_text(
+        "4. 🏢 Ishlashni xohlagan filialingizni yozing.\nShahar yoki tuman nomini kiriting."
+    )
+    return BRANCH
+
+
+async def branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if len(value) < 2:
+        await update.message.reply_text("Iltimos, filial shahar yoki tuman nomini yozing.")
+        return BRANCH
+
+    context.user_data["branch"] = value
+    await update.message.reply_text(
+        "5. 🎓 Ma'lumot darajangizni tanlang.",
+        reply_markup=EDUCATION_KEYBOARD,
+    )
+    return EDUCATION
+
+
+async def education_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
-    role = query.data.split(":", 1)[1]
-    context.user_data["role"] = role
-    await query.edit_message_reply_markup(reply_markup=None)
-
-    if role == "teacher":
-        context.user_data["direction_type"] = "teacher"
-        await query.message.reply_text(
-            "📚 Qaysi fan yoki yo'nalishni o'qitasiz? Masalan: Matematika"
-        )
-        return DIRECTION
-
-    context.user_data["direction"] = "Admin / Support"
-    context.user_data["certificates"] = []
-    await query.message.reply_text("🌐 Qaysi tillarni bilasiz? Masalan: O'zbek, Rus, Ingliz")
-    return LANGUAGES
-
-
-async def invalid_role_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await reply_to_update(
-        update,
-        "Iltimos, quyidagi tugmalardan birini tanlang.",
-        reply_markup=ROLE_KEYBOARD,
-    )
-    return ROLE_CHOICE
-
-
-async def languages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    languages_text = update.message.text.strip()
-    if len(languages_text) < 2:
-        await update.message.reply_text("Iltimos, biladigan tillaringizni yozing.")
-        return LANGUAGES
-
-    context.user_data["languages"] = languages_text
-    await ask_experience(update)
+    key = query.data.split(":", 1)[1]
+    context.user_data["education"] = EDUCATION_LABELS[key]
+    await query.edit_message_text(f"5. 🎓 Ma'lumot: {EDUCATION_LABELS[key]}")
+    await ask_experience(query.message)
     return EXPERIENCE_CHOICE
 
 
-async def invalid_languages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await reply_to_update(update, "🌐 Iltimos, tillarni matn ko'rinishida yozing.")
-    return LANGUAGES
+async def invalid_education(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await reply_to_update(
+        update,
+        "Iltimos, ma'lumot darajasini tugmalardan tanlang.",
+        reply_markup=EDUCATION_KEYBOARD,
+    )
+    return EDUCATION
 
 
-async def ask_experience(update: Update) -> None:
-    message = update.callback_query.message if update.callback_query else update.message
+async def ask_experience(message) -> None:
     await message.reply_text(
-        "💼 Ushbu sohada tajribangiz bormi?",
+        "6. 💼 Shu sohada umumiy ish tajribangiz bormi?",
         reply_markup=EXPERIENCE_INLINE_KEYBOARD,
     )
-
-
-async def finish_after_experience(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-    if context.user_data.get("role") == "admin":
-        return await certificates_done(update, context)
-
-    await ask_certificates(update)
-    return CERTIFICATES
-
-
-async def reply_to_update(
-    update: Update,
-    text: str,
-    reply_markup=None,
-) -> None:
-    if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup)
-        return
-
-    if update.callback_query and update.callback_query.message:
-        await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
 
 
 async def experience_choice_callback(
@@ -547,108 +647,228 @@ async def experience_choice_callback(
 ) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_reply_markup(reply_markup=None)
 
-    choice = query.data.split(":", 1)[1]
-    if choice == "yes":
-        await query.message.reply_text(
-            "⏳ Necha yil yoki oy tajribangiz bor? Masalan: 2 yil yoki 6 oy",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+    key = query.data.split(":", 1)[1]
+    await query.edit_message_reply_markup(reply_markup=None)
+    if key == "yes":
+        await query.message.reply_text("⏳ Shu sohada umumiy ish tajribangiz necha yil?")
         return EXPERIENCE_YEARS
 
     context.user_data["experience"] = "0 yil"
-    return await finish_after_experience(update, context)
+    await query.message.reply_text("6. 💼 Tajriba: 0 yil")
+    await query.message.reply_text(
+        "7. 🏬 Oldingi ish joyingizda necha yil ishlagansiz?\nLavozimingizni ham yozishingiz mumkin."
+    )
+    return PREVIOUS_JOB
 
 
-async def invalid_experience_callback(
+async def invalid_experience_choice(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    await ask_experience(update)
-    return EXPERIENCE_CHOICE
-
-
-async def direction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    direction_text = update.message.text.strip()
-    if len(direction_text) < 2:
-        await update.message.reply_text("Iltimos, fan yoki yo'nalishni kiriting.")
-        return DIRECTION
-
-    context.user_data["direction"] = direction_text
-    context.user_data["languages"] = ""
-    await ask_experience(update)
-    return EXPERIENCE_CHOICE
-
-
-async def invalid_direction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await reply_to_update(update, "📚 Iltimos, fan yoki yo'nalishni matn ko'rinishida yozing.")
-    return DIRECTION
-
-
-async def experience_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    answer = update.message.text.strip().lower()
-
-    if "ha" in answer:
-        await update.message.reply_text(
-            "⏳ Necha yil yoki oy tajribangiz bor? Masalan: 2 yil yoki 6 oy",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return EXPERIENCE_YEARS
-
-    if "yo'q" in answer or "yoq" in answer:
-        context.user_data["experience"] = "0 yil"
-        return await finish_after_experience(update, context)
-
-    await ask_experience(update)
+    await reply_to_update(
+        update,
+        "Iltimos, tajriba bo'yicha Ha yoki Yo'q tugmasini tanlang.",
+        reply_markup=EXPERIENCE_INLINE_KEYBOARD,
+    )
     return EXPERIENCE_CHOICE
 
 
 async def experience_years(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    experience = update.message.text.strip()
-    if not experience:
-        await update.message.reply_text("Iltimos, tajribangizni kiriting. Masalan: 3 yil")
+    value = update.message.text.strip()
+    if not value:
+        await update.message.reply_text("Iltimos, tajribangizni yozing. Masalan: 3 yil")
         return EXPERIENCE_YEARS
 
-    if experience.isdigit():
-        experience = f"{experience} yil"
+    if value.isdigit():
+        value = f"{value} yil"
 
-    context.user_data["experience"] = experience
-    return await finish_after_experience(update, context)
-
-
-async def ask_certificates(update: Update) -> None:
+    context.user_data["experience"] = value
     await update.message.reply_text(
-        "📜 Sertifikatlaringiz rasmlarini yuboring. Bir nechta sertifikat bo'lsa, "
-        "barchasini yuborishingiz mumkin.\n\n"
-        "Sertifikat bo'lmasa \"⏭ Skip\" tugmasini bosing yoki /skip yuboring.\n"
-        "Barcha rasmlarni yuborib bo'lgach, \"✅ Tugatildi\" tugmasini bosing.",
-        reply_markup=CERTIFICATE_KEYBOARD,
+        "7. 🏬 Oldingi ish joyingizda necha yil ishlagansiz?\nLavozimingizni ham yozishingiz mumkin."
     )
+    return PREVIOUS_JOB
 
 
-async def save_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    certificate = get_certificate_info(update)
-    if not certificate:
+async def previous_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if len(value) < 2:
+        await update.message.reply_text("Oldingi ish joyingiz haqida qisqacha yozing.")
+        return PREVIOUS_JOB
+
+    context.user_data["previous_job"] = value
+    await update.message.reply_text(
+        "8. ⚖️ Sudlanganmisiz?",
+        reply_markup=CONVICTED_KEYBOARD,
+    )
+    return CONVICTED
+
+
+async def convicted_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    key = query.data.split(":", 1)[1]
+    context.user_data["convicted"] = YES_NO_LABELS[key]
+    await query.edit_message_text(f"8. ⚖️ Sudlangan: {YES_NO_LABELS[key]}")
+    await query.message.reply_text(
+        "9. 👪 Oilaviy holatingiz qanday? Farzandlaringiz bormi?"
+    )
+    return FAMILY_STATUS
+
+
+async def invalid_convicted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await reply_to_update(
+        update,
+        "Iltimos, sudlanganlik bo'yicha Ha yoki Yo'q tugmasini tanlang.",
+        reply_markup=CONVICTED_KEYBOARD,
+    )
+    return CONVICTED
+
+
+async def family_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if len(value) < 2:
+        await update.message.reply_text("Oilaviy holatingizni qisqacha yozing.")
+        return FAMILY_STATUS
+
+    context.user_data["family_status"] = value
+    await update.message.reply_text("10. 💰 Oxirgi ish joyingizda qancha maosh olgansiz?")
+    return PREVIOUS_SALARY
+
+
+async def previous_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if len(value) < 2:
+        await update.message.reply_text("Iltimos, oldingi maoshingizni yozing.")
+        return PREVIOUS_SALARY
+
+    context.user_data["previous_salary"] = value
+    await update.message.reply_text("11. 💵 Qancha maoshga ishlashni xohlaysiz?")
+    return EXPECTED_SALARY
+
+
+async def expected_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if len(value) < 2:
+        await update.message.reply_text("Iltimos, xohlagan maoshingizni yozing.")
+        return EXPECTED_SALARY
+
+    context.user_data["expected_salary"] = value
+    await update.message.reply_text(
+        "12. 📝 Microsoft Word dasturini bilish darajangizni tanlang.",
+        reply_markup=WORD_LEVEL_KEYBOARD,
+    )
+    return WORD_LEVEL
+
+
+async def word_level_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    key = query.data.split(":", 1)[1]
+    context.user_data["word_level"] = LEVEL_LABELS[key]
+    await query.edit_message_text(f"12. 📝 Word: {LEVEL_LABELS[key]}")
+    await query.message.reply_text(
+        "13. 📊 Microsoft Excel dasturini bilish darajangizni tanlang.",
+        reply_markup=EXCEL_LEVEL_KEYBOARD,
+    )
+    return EXCEL_LEVEL
+
+
+async def invalid_word_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await reply_to_update(
+        update,
+        "Iltimos, Word darajasini tugmalardan tanlang.",
+        reply_markup=WORD_LEVEL_KEYBOARD,
+    )
+    return WORD_LEVEL
+
+
+async def excel_level_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    key = query.data.split(":", 1)[1]
+    context.user_data["excel_level"] = LEVEL_LABELS[key]
+    await query.edit_message_text(f"13. 📊 Excel: {LEVEL_LABELS[key]}")
+    await query.message.reply_text(
+        "14. 🌐 Qaysi tillarni bilasiz va qay darajada?\nMasalan: O'zbekcha yaxshi, Ruscha o'rtacha"
+    )
+    return LANGUAGES
+
+
+async def invalid_excel_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await reply_to_update(
+        update,
+        "Iltimos, Excel darajasini tugmalardan tanlang.",
+        reply_markup=EXCEL_LEVEL_KEYBOARD,
+    )
+    return EXCEL_LEVEL
+
+
+async def languages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if len(value) < 2:
+        await update.message.reply_text("Iltimos, biladigan tillaringizni yozing.")
+        return LANGUAGES
+
+    context.user_data["languages"] = value
+    await update.message.reply_text(
+        "15. ⏳ “Fariks O'quv markazi”da necha yil ishlash niyatingiz bor?"
+    )
+    return FARIKS_DURATION
+
+
+async def fariks_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if len(value) < 1:
+        await update.message.reply_text("Iltimos, necha yil ishlash niyatingiz borligini yozing.")
+        return FARIKS_DURATION
+
+    context.user_data["fariks_duration"] = value
+    await update.message.reply_text(
+        "16. ❓ Nima uchun aynan “Fariks”da ishlashni xohlaysiz?"
+    )
+    return MOTIVATION
+
+
+async def motivation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if len(value) < 3:
+        await update.message.reply_text("Iltimos, sababini qisqacha yozing.")
+        return MOTIVATION
+
+    context.user_data["motivation"] = value
+    await update.message.reply_text("17. 📞 Telefon raqamingizni yozing. Masalan: +998901234567")
+    return PHONE
+
+
+async def phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    if not phone_pattern.match(value):
         await update.message.reply_text(
-            "📜 Iltimos, sertifikat rasmini yuboring, \"✅ Tugatildi\" yoki \"⏭ Skip\" tugmasini bosing.",
-            reply_markup=CERTIFICATE_KEYBOARD,
+            "Telefon raqamini to'g'ri formatda yuboring. Masalan: +998901234567"
         )
-        return CERTIFICATES
+        return PHONE
 
-    context.user_data.setdefault("certificates", []).append(certificate)
-
-    await update.message.reply_text(
-        "✅ Sertifikat qabul qilindi. Yana rasm yuborishingiz yoki "
-        "\"✅ Tugatildi\" tugmasini bosishingiz mumkin.",
-        reply_markup=CERTIFICATE_KEYBOARD,
-    )
-    return CERTIFICATES
+    context.user_data["phone"] = value
+    await update.message.reply_text("18. 📷 Oxirgi 1 oy ichida tushgan rasmingizni yuboring.")
+    return RECENT_PHOTO
 
 
-def get_certificate_info(update: Update) -> dict | None:
+async def recent_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    image = get_image_info(update)
+    if not image:
+        await update.message.reply_text("Iltimos, rasm yuboring.")
+        return RECENT_PHOTO
+
+    context.user_data["recent_photo"] = image
+    return await finish_application(update, context)
+
+
+def get_image_info(update: Update) -> dict | None:
     message = update.message
-
     if message.photo:
         return {
             "type": "photo",
@@ -665,14 +885,35 @@ def get_certificate_info(update: Update) -> dict | None:
     return None
 
 
-async def certificates_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def invalid_recent_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Iltimos, oxirgi 1 oy ichida tushgan rasmingizni yuboring.")
+    return RECENT_PHOTO
+
+
+async def finish_application(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     upsert_user(user)
 
-    required_fields = ["full_name", "phone", "age", "role", "direction", "experience"]
-    if context.user_data.get("role") == "admin":
-        required_fields.append("languages")
-
+    required_fields = [
+        "full_name",
+        "birth_date",
+        "address",
+        "branch",
+        "education",
+        "experience",
+        "previous_job",
+        "convicted",
+        "family_status",
+        "previous_salary",
+        "expected_salary",
+        "word_level",
+        "excel_level",
+        "languages",
+        "fariks_duration",
+        "motivation",
+        "phone",
+        "recent_photo",
+    ]
     if any(not context.user_data.get(field) for field in required_fields):
         await reply_to_update(update, "Ariza ma'lumotlari to'liq emas. /start orqali qayta boshlang.")
         context.user_data.clear()
@@ -704,6 +945,19 @@ async def certificates_done(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 
+async def reply_to_update(
+    update: Update,
+    text: str,
+    reply_markup=None,
+) -> None:
+    if update.message:
+        await update.message.reply_text(text, reply_markup=reply_markup)
+        return
+
+    if update.callback_query and update.callback_query.message:
+        await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
+
+
 async def send_application_to_admin(
     context: ContextTypes.DEFAULT_TYPE,
     application: dict,
@@ -711,13 +965,11 @@ async def send_application_to_admin(
     if not ADMIN_CHAT_ID:
         raise RuntimeError("ADMIN_CHAT_ID .env faylida ko'rsatilmagan.")
 
-    keyboard = build_decision_keyboard(application["id"])
     await send_application_to_chat(
         context=context,
         chat_id=ADMIN_CHAT_ID,
         application=application,
-        reply_markup=keyboard,
-        controls_for_album=True,
+        reply_markup=build_decision_keyboard(application["id"]),
     )
 
 
@@ -726,46 +978,47 @@ async def send_application_to_chat(
     chat_id: str,
     application: dict,
     reply_markup: InlineKeyboardMarkup | None = None,
-    controls_for_album: bool = False,
 ) -> None:
     caption = build_application_caption(application)
-    certificates = application["certificates"]
+    image = application.get("recent_photo") or {}
 
-    if not certificates:
-        await context.bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
+    if not image:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=limit_telegram_text(caption),
+            reply_markup=reply_markup,
+        )
         return
 
-    if len(certificates) == 1:
-        await send_single_certificate(
+    if len(caption) <= 1024:
+        await send_single_image(
             context=context,
             chat_id=chat_id,
-            certificate=certificates[0],
+            image=image,
             caption=caption,
             reply_markup=reply_markup,
         )
         return
 
-    await send_certificates_album(context, chat_id, certificates, caption)
-
-    if reply_markup and controls_for_album:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"Ariza #{application['id']} bo'yicha qaror tanlang:",
-            reply_markup=reply_markup,
-        )
+    await send_single_image(context=context, chat_id=chat_id, image=image, caption=None)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=limit_telegram_text(caption),
+        reply_markup=reply_markup,
+    )
 
 
-async def send_single_certificate(
+async def send_single_image(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: str,
-    certificate: dict,
+    image: dict,
     caption: str | None,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
-    if certificate["type"] == "photo":
+    if image.get("type") == "photo":
         await context.bot.send_photo(
             chat_id=chat_id,
-            photo=certificate["file_id"],
+            photo=image["file_id"],
             caption=caption,
             reply_markup=reply_markup,
         )
@@ -773,92 +1026,39 @@ async def send_single_certificate(
 
     await context.bot.send_document(
         chat_id=chat_id,
-        document=certificate["file_id"],
+        document=image["file_id"],
         caption=caption,
         reply_markup=reply_markup,
     )
 
 
-async def send_certificates_album(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: str,
-    certificates: list[dict],
-    caption: str,
-) -> None:
-    caption_sent = False
-    for certificates_chunk in build_certificate_chunks(certificates):
-        chunk_caption = caption if not caption_sent else None
-        if len(certificates_chunk) == 1:
-            await send_single_certificate(
-                context=context,
-                chat_id=chat_id,
-                certificate=certificates_chunk[0],
-                caption=chunk_caption,
-            )
-        else:
-            await context.bot.send_media_group(
-                chat_id=chat_id,
-                media=build_media_group(certificates_chunk, chunk_caption),
-            )
-        caption_sent = True
-
-
-def build_certificate_chunks(certificates: list[dict]) -> list[list[dict]]:
-    chunks = []
-    current_chunk = []
-    current_type = None
-
-    for certificate in certificates:
-        if (
-            current_chunk
-            and (certificate["type"] != current_type or len(current_chunk) == 10)
-        ):
-            chunks.append(current_chunk)
-            current_chunk = []
-
-        current_chunk.append(certificate)
-        current_type = certificate["type"]
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
-
-
-def build_media_group(certificates: list[dict], caption: str | None) -> list:
-    media_group = []
-
-    for index, certificate in enumerate(certificates):
-        item_caption = caption if index == 0 else None
-        if certificate["type"] == "photo":
-            media_group.append(InputMediaPhoto(media=certificate["file_id"], caption=item_caption))
-        else:
-            media_group.append(InputMediaDocument(media=certificate["file_id"], caption=item_caption))
-
-    return media_group
-
-
 def build_application_caption(application: dict) -> str:
-    text = (
+    return (
         "🆕 Yangi nomzod\n\n"
-        f"👤 Ism: {application['full_name']}\n"
-        f"📞 Telefon: {application['phone']}\n"
-        f"🎂 Yosh: {application['age']}\n"
-        f"💼 Tajriba: {application['experience']}\n"
-        f"🚩 Yo'nalish: {application['direction']}\n"
+        f"👤 Ism-sharif: {application['full_name']}\n"
+        f"🎂 Tug'ilgan sana: {application['birth_date']}\n"
+        f"📍 Manzil: {application['address']}\n"
+        f"🏢 Filial: {application['branch']}\n"
+        f"🎓 Ma'lumot: {application['education']}\n"
+        f"💼 Soha tajribasi: {application['experience']}\n"
+        f"🏬 Oldingi ish joyi: {application['previous_job']}\n"
+        f"⚖️ Sudlangan: {application['convicted']}\n"
+        f"👪 Oilaviy holati: {application['family_status']}\n"
+        f"💰 Oldingi maosh: {application['previous_salary']}\n"
+        f"💵 Kutilayotgan maosh: {application['expected_salary']}\n"
+        f"📝 Word: {application['word_level']}\n"
+        f"📊 Excel: {application['excel_level']}\n"
+        f"🌐 Tillar: {application['languages']}\n"
+        f"⏳ Fariksda ishlash niyati: {application['fariks_duration']}\n"
+        f"❓ Nega Fariks: {application['motivation']}\n"
+        f"📞 Telefon: {application['phone']}"
     )
-    if application.get("languages"):
-        text += f"🌐 Tillar: {application['languages']}\n"
-    if application.get("role") != "admin":
-        certificates_text = (
-            f"{application['certificate_count']} ta"
-            if application["certificate_count"]
-            else "Sertifikat yo'q"
-        )
-        text += f"📜 Sertifikatlar: {certificates_text}"
-    else:
-        text = text.rstrip()
-    return text
+
+
+def limit_telegram_text(text: str, limit: int = 3900) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 20].rstrip() + "\n\n... qisqartirildi"
 
 
 def build_decision_keyboard(application_id: int) -> InlineKeyboardMarkup:
@@ -932,7 +1132,7 @@ async def handle_application_decision(
     await notify_user(
         context,
         application["user_id"],
-        "Arizangiz rad etildi. Yangi ariza yuborishingiz mumkin.",
+        "Arizangiz rad etildi. ❌",
     )
     await remove_decision_buttons(query)
     await query.answer("Ariza rad etildi.")
@@ -954,6 +1154,115 @@ async def notify_user(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: st
         await context.bot.send_message(chat_id=user_id, text=text)
     except Exception as error:
         logger.warning("Foydalanuvchiga xabar bormadi (%s): %s", user_id, format_runtime_error(error))
+
+
+def sync_excel_file() -> Path:
+    EXCEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Arizalar"
+
+    headers = [
+        "ID",
+        "Sana",
+        "Holat",
+        "Telegram ID",
+        "Username",
+        "Ism-sharif",
+        "Tug'ilgan sana",
+        "Manzil",
+        "Filial",
+        "Ma'lumot",
+        "Soha tajribasi",
+        "Oldingi ish joyi",
+        "Sudlangan",
+        "Oilaviy holati",
+        "Oldingi maosh",
+        "Kutilayotgan maosh",
+        "Word",
+        "Excel",
+        "Tillar",
+        "Fariksda ishlash niyati",
+        "Nega Fariks",
+        "Telefon",
+        "Rasm file_id",
+        "Qaror sanasi",
+        "Qaror qilgan admin",
+    ]
+    sheet.append(headers)
+
+    for row in get_all_application_rows():
+        application = row_to_application(row)
+        photo = application.get("recent_photo") or {}
+        sheet.append(
+            [
+                application["id"],
+                format_iso_datetime(application["created_at"]),
+                status_label(application["status"]),
+                application["user_id"],
+                application["username"] or "",
+                application["full_name"],
+                application["birth_date"],
+                application["address"],
+                application["branch"],
+                application["education"],
+                application["experience"],
+                application["previous_job"],
+                application["convicted"],
+                application["family_status"],
+                application["previous_salary"],
+                application["expected_salary"],
+                application["word_level"],
+                application["excel_level"],
+                application["languages"],
+                application["fariks_duration"],
+                application["motivation"],
+                application["phone"],
+                photo.get("file_id", ""),
+                format_iso_datetime(application.get("decided_at") or ""),
+                application.get("decided_by") or "",
+            ]
+        )
+
+    for cell in sheet[1]:
+        font = copy(cell.font)
+        font.bold = True
+        cell.font = font
+
+    for column in sheet.columns:
+        width = min(
+            max(len(str(cell.value or "")) for cell in column) + 2,
+            45,
+        )
+        sheet.column_dimensions[get_column_letter(column[0].column)].width = width
+
+    workbook.save(EXCEL_FILE)
+    return EXCEL_FILE
+
+
+def safe_sync_excel_file() -> Path | None:
+    try:
+        return sync_excel_file()
+    except Exception as error:
+        logger.warning("Excel yangilashda xatolik: %s", format_runtime_error(error))
+        return None
+
+
+def status_label(status: str) -> str:
+    return {
+        "pending": "Kutilmoqda",
+        "approved": "Tasdiqlangan",
+        "rejected": "Rad etilgan",
+    }.get(status, status)
+
+
+def format_iso_datetime(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.fromisoformat(value).astimezone().strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return value
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -991,6 +1300,33 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def admin_excel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    upsert_user(query.from_user)
+
+    if not is_admin(query.from_user.id):
+        await query.answer("Bu bo'lim faqat adminlar uchun.", show_alert=True)
+        return
+
+    await query.answer("Excel tayyorlanyapti...")
+    try:
+        excel_path = sync_excel_file()
+    except Exception as error:
+        logger.error("Excel yuborishda xatolik: %s", format_runtime_error(error))
+        await query.message.reply_text(
+            "Excel fayl tayyorlashda xatolik bo'ldi. Fayl ochiq bo'lsa yopib qayta urinib ko'ring."
+        )
+        return
+
+    with excel_path.open("rb") as file:
+        await context.bot.send_document(
+            chat_id=query.message.chat_id,
+            document=file,
+            filename=excel_path.name,
+            caption="📊 Arizalar Excel fayli",
+        )
+
+
 def build_admin_panel_text() -> str:
     stats = get_stats()
     return (
@@ -1010,6 +1346,7 @@ def build_admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("➕ Admin qo'shish", callback_data="admin:add"),
                 InlineKeyboardButton("➖ Admin o'chirish", callback_data="admin:remove"),
             ],
+            [InlineKeyboardButton("📊 Excel", callback_data="admin:excel")],
             [InlineKeyboardButton("🔄 Yangilash", callback_data="admin:refresh")],
         ]
     )
@@ -1021,7 +1358,7 @@ async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not is_admin(query.from_user.id):
         await query.answer("Bu amal faqat adminlar uchun.", show_alert=True)
-        return
+        return ConversationHandler.END
 
     await query.answer()
     admin_pending_actions[query.from_user.id] = ADD_ADMIN_TARGET
@@ -1029,6 +1366,7 @@ async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "Yangi adminning Telegram ID raqamini yoki @username yuboring.\n"
         "Bekor qilish uchun /cancel.",
     )
+    return ConversationHandler.END
 
 
 async def admin_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1114,26 +1452,6 @@ async def admin_pending_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if action == REMOVE_ADMIN_TARGET:
         await admin_remove_receive(update, context)
-        return
-
-
-async def invalid_experience_choice(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-    await ask_experience(update)
-    return EXPERIENCE_CHOICE
-
-
-async def invalid_certificate(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-    await update.message.reply_text(
-        "Iltimos, sertifikat rasmini yuboring, \"Tugatildi\" yoki \"Skip\" tugmasini bosing.",
-        reply_markup=CERTIFICATE_KEYBOARD,
-    )
-    return CERTIFICATES
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1224,47 +1542,42 @@ def main() -> None:
             MessageHandler(filters.Regex(r"^(📝\s*)?Ariza yuborish$"), begin_application),
         ],
         states={
-            FULL_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, full_name),
-            ],
-            PHONE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, phone),
-            ],
-            AGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, age),
-            ],
-            ROLE_CHOICE: [
-                CallbackQueryHandler(role_choice, pattern=r"^role:(admin|teacher)$"),
-                MessageHandler(filters.ALL, invalid_role_choice),
-            ],
-            DIRECTION: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, direction),
-                MessageHandler(filters.ALL, invalid_direction),
-            ],
-            LANGUAGES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, languages),
-                MessageHandler(filters.ALL, invalid_languages),
+            FULL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, full_name)],
+            BIRTH_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, birth_date)],
+            ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address)],
+            BRANCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, branch)],
+            EDUCATION: [
+                CallbackQueryHandler(education_choice, pattern=r"^education:(higher|secondary)$"),
+                MessageHandler(filters.ALL, invalid_education),
             ],
             EXPERIENCE_CHOICE: [
                 CallbackQueryHandler(experience_choice_callback, pattern=r"^exp:(yes|no)$"),
-                MessageHandler(
-                    filters.Regex(r"^(✅\s*)?Ha$|^(❌\s*)?Yo'?q$"),
-                    experience_choice,
-                ),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, invalid_experience_choice),
-                MessageHandler(filters.ALL, invalid_experience_callback),
+                MessageHandler(filters.ALL, invalid_experience_choice),
             ],
-            EXPERIENCE_YEARS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, experience_years),
+            EXPERIENCE_YEARS: [MessageHandler(filters.TEXT & ~filters.COMMAND, experience_years)],
+            PREVIOUS_JOB: [MessageHandler(filters.TEXT & ~filters.COMMAND, previous_job)],
+            CONVICTED: [
+                CallbackQueryHandler(convicted_choice, pattern=r"^convicted:(yes|no)$"),
+                MessageHandler(filters.ALL, invalid_convicted),
             ],
-            CERTIFICATES: [
-                CommandHandler("skip", certificates_done),
-                MessageHandler(
-                    filters.Regex(r"(?i)^((✅\s*)?Tugatildi|(⏭\s*)?skip)$"),
-                    certificates_done,
-                ),
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, save_certificate),
-                MessageHandler(filters.ALL, invalid_certificate),
+            FAMILY_STATUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, family_status)],
+            PREVIOUS_SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, previous_salary)],
+            EXPECTED_SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, expected_salary)],
+            WORD_LEVEL: [
+                CallbackQueryHandler(word_level_choice, pattern=r"^word:(unknown|basic|medium|good)$"),
+                MessageHandler(filters.ALL, invalid_word_level),
+            ],
+            EXCEL_LEVEL: [
+                CallbackQueryHandler(excel_level_choice, pattern=r"^excel:(unknown|basic|medium|good)$"),
+                MessageHandler(filters.ALL, invalid_excel_level),
+            ],
+            LANGUAGES: [MessageHandler(filters.TEXT & ~filters.COMMAND, languages)],
+            FARIKS_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, fariks_duration)],
+            MOTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, motivation)],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone)],
+            RECENT_PHOTO: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, recent_photo),
+                MessageHandler(filters.ALL, invalid_recent_photo),
             ],
         },
         fallbacks=[
@@ -1279,13 +1592,12 @@ def main() -> None:
     )
     application.add_handler(CallbackQueryHandler(admin_add_start, pattern=r"^admin:add$"))
     application.add_handler(CallbackQueryHandler(admin_remove_start, pattern=r"^admin:remove$"))
+    application.add_handler(CallbackQueryHandler(admin_excel_callback, pattern=r"^admin:excel$"))
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern=r"^admin:refresh$"))
     application.add_handler(CommandHandler("myid", my_id))
     application.add_handler(CommandHandler("cancel", admin_cancel))
     application.add_handler(MessageHandler(filters.Regex(r"^(🛠\s*)?Admin panel$"), admin_panel))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pending_text)
-    )
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pending_text))
     application.add_error_handler(error_handler)
     try:
         run_bot(application)
@@ -1299,25 +1611,22 @@ def format_runtime_error(error: Exception | None) -> str:
         return "Noma'lum xatolik."
 
     text = str(error)
-    lowered = text.lower()
+    lower_text = text.lower()
 
-    if "unauthorized" in lowered:
-        return "Bot token xato yoki bekor qilingan. Tokenni tekshiring."
-    if "chat not found" in lowered:
+    if "unauthorized" in lower_text:
+        return "Bot token noto'g'ri yoki bot o'chirilgan."
+    if "not found" in lower_text and "chat" in lower_text:
         return "Admin yoki kanal ID topilmadi. ADMIN_CHAT_ID/PUBLISH_CHAT_ID ni tekshiring."
-    if "forbidden" in lowered:
-        return "Botda ruxsat yo'q. Bot kanal/guruhda adminmi yoki user botni start qilganmi, tekshiring."
-    if is_polling_conflict(error):
+    if "forbidden" in lower_text:
+        return "Botda ruxsat yo'q. Botni admin guruh/kanalga admin qiling yoki foydalanuvchi botni bloklagan."
+    if "terminated by other getupdates" in lower_text or ("conflict" in lower_text and "getupdates" in lower_text):
         return (
-            "Bot boshqa joyda ham ishlayapti. Bir xil token bilan faqat bitta bot "
-            "ishlashi kerak: local `python main.py`ni to'xtating yoki Railway replicasini 1 ta qiling."
+            "Bot boshqa joyda ham ishlayapti. Bir xil token bilan faqat bitta bot ishlashi kerak: "
+            "local `python main.py`ni to'xtating yoki Railway replicasini 1 ta qiling."
         )
-    if "webhook" in lowered and "tornado" in lowered:
-        return "Webhook uchun kerakli kutubxona yo'q. `pip install -r requirements.txt` qiling."
-    if "database is locked" in lowered:
-        return "SQLite bazasi band. Botni ikki marta ishga tushirmaganingizni tekshiring."
-    if not text:
-        return error.__class__.__name__
+    if "no module named" in lower_text:
+        return "Kerakli kutubxona o'rnatilmagan. `pip install -r requirements.txt` qiling."
+
     return text
 
 

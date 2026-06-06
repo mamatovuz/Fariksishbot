@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -6,6 +7,8 @@ import sqlite3
 import sys
 import time
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -93,7 +96,13 @@ REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL") or DEFAULT_REQUIRED_CHA
     REVIEW_APPLICATION,
     EDIT_FIELD,
 ) = range(25)
-ADD_ADMIN_TARGET, REMOVE_ADMIN_TARGET, SEARCH_APPLICATION_TARGET, FILTER_BRANCH_TARGET = range(100, 104)
+(
+    ADD_ADMIN_TARGET,
+    REMOVE_ADMIN_TARGET,
+    SEARCH_APPLICATION_TARGET,
+    FILTER_BRANCH_TARGET,
+    BROADCAST_TARGET,
+) = range(100, 105)
 
 EDUCATION_LABELS = {
     "higher": "Oliy ma'lumotli",
@@ -221,10 +230,18 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def db_connect() -> sqlite3.Connection:
+@contextmanager
+def db_connect() -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(DB_FILE)
     connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def init_db() -> None:
@@ -374,6 +391,14 @@ def upsert_user(user) -> None:
                 now_iso(),
             ),
         )
+
+
+def get_all_user_ids() -> list[int]:
+    with db_connect() as connection:
+        rows = connection.execute(
+            "SELECT user_id FROM users ORDER BY updated_at DESC, user_id DESC"
+        ).fetchall()
+    return [row["user_id"] for row in rows]
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -2398,6 +2423,9 @@ def build_admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🏢 Filial filter", callback_data="admin:filter_branch"),
                 InlineKeyboardButton("📊 Excel", callback_data="admin:excel"),
             ],
+            [
+                InlineKeyboardButton("📣 Xabar yuborish", callback_data="admin:broadcast"),
+            ],
         ]
     )
 
@@ -2479,6 +2507,24 @@ async def admin_filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    upsert_user(query.from_user)
+
+    if not is_admin(query.from_user.id):
+        await query.answer("Bu amal faqat adminlar uchun.", show_alert=True)
+        return
+
+    await query.answer()
+    admin_pending_actions[query.from_user.id] = BROADCAST_TARGET
+    await query.message.reply_text(
+        "📣 Hammaga yuboriladigan xabarni yuboring.\n\n"
+        "Matn, rasm, video yoki GIF yuborishingiz mumkin.\n"
+        "Rasm/video/GIF captionidagi matn ham foydalanuvchilarga boradi.\n\n"
+        "Bekor qilish uchun /cancel.",
+    )
+
+
 async def admin_search_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query_text = update.message.text.strip()
     if len(query_text) < 2:
@@ -2505,6 +2551,54 @@ async def admin_filter_receive(update: Update, context: ContextTypes.DEFAULT_TYP
         build_application_list_text(f"Filial: {branch_text}", rows),
         reply_markup=build_application_list_keyboard(rows),
     )
+
+
+async def admin_broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        admin_pending_actions.pop(update.effective_user.id, None)
+        await update.message.reply_text("Bu amal faqat adminlar uchun.")
+        return
+
+    message = update.message
+    user_ids = get_all_user_ids()
+    admin_pending_actions.pop(update.effective_user.id, None)
+
+    if not user_ids:
+        await message.reply_text("📭 Hozircha foydalanuvchilar topilmadi.", reply_markup=ADMIN_MAIN_KEYBOARD)
+        return
+
+    progress_message = await message.reply_text(
+        f"📣 Xabar {len(user_ids)} ta foydalanuvchiga yuborilmoqda..."
+    )
+
+    sent_count = 0
+    failed_count = 0
+    for index, user_id in enumerate(user_ids, start=1):
+        try:
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+            )
+            sent_count += 1
+        except Exception as error:
+            failed_count += 1
+            logger.warning(
+                "Ommaviy xabar yuborilmadi. user_id=%s, xatolik=%s",
+                user_id,
+                format_runtime_error(error),
+            )
+
+        if index % 25 == 0:
+            await asyncio.sleep(0.3)
+
+    await progress_message.edit_text(
+        "✅ Ommaviy xabar yuborish tugadi.\n\n"
+        f"👥 Jami foydalanuvchi: {len(user_ids)} ta\n"
+        f"✅ Yetib bordi: {sent_count} ta\n"
+        f"⚠️ Yuborilmadi: {failed_count} ta"
+    )
+    await message.reply_text("🛠 Admin panel", reply_markup=ADMIN_MAIN_KEYBOARD)
 
 
 def build_application_list_text(title: str, rows: list[sqlite3.Row]) -> str:
@@ -2633,11 +2727,25 @@ async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def admin_pending_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
     if update.effective_user.id in admin_reject_targets:
+        if not update.message.text:
+            await update.message.reply_text("Iltimos, rad etish sababini matn qilib yuboring.")
+            return
         await admin_reject_reason_receive(update, context)
         return
 
     action = admin_pending_actions.get(update.effective_user.id)
+    if action == BROADCAST_TARGET:
+        await admin_broadcast_receive(update, context)
+        return
+
+    if action and not update.message.text:
+        await update.message.reply_text("Iltimos, bu amal uchun matn yuboring.")
+        return
+
     if action == ADD_ADMIN_TARGET:
         await admin_add_receive(update, context)
         return
@@ -2878,6 +2986,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(admin_add_start, pattern=r"^admin:add$"))
     application.add_handler(CallbackQueryHandler(admin_remove_start, pattern=r"^admin:remove$"))
     application.add_handler(CallbackQueryHandler(admin_excel_callback, pattern=r"^admin:excel$"))
+    application.add_handler(CallbackQueryHandler(admin_broadcast_start, pattern=r"^admin:broadcast$"))
     application.add_handler(CallbackQueryHandler(admin_status_list_callback, pattern=r"^admin:list:(pending|approved|rejected)$"))
     application.add_handler(CallbackQueryHandler(admin_view_application_callback, pattern=r"^admin:view:\d+$"))
     application.add_handler(CallbackQueryHandler(admin_search_start, pattern=r"^admin:search$"))
@@ -2886,7 +2995,12 @@ def main() -> None:
     application.add_handler(CommandHandler("myid", my_id))
     application.add_handler(CommandHandler("cancel", admin_cancel))
     application.add_handler(MessageHandler(filters.Regex(r"^(🛠\s*)?Admin panel$"), admin_panel))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pending_text))
+    application.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION) & ~filters.COMMAND,
+            admin_pending_text,
+        )
+    )
     application.add_error_handler(error_handler)
     try:
         run_bot(application)

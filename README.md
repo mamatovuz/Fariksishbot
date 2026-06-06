@@ -27,6 +27,8 @@ Admin panelda arizalarni status bo'yicha ko'rish, ism/telefon/filial bo'yicha qi
 filial bo'yicha filter qilish va rad etishda sabab yozish imkoniyati bor.
 Bir arizani faqat bitta admin yakunlay oladi: kim birinchi tasdiqlasa yoki rad etsa,
 qolgan adminlardagi inline tugmalar ishlamaydi va qaror haqida xabar boradi.
+Admin paneldagi `📣 Xabar yuborish` tugmasi orqali barcha foydalanuvchilarga matn,
+rasm, video yoki GIF yuborish mumkin. Media captionidagi matn ham birga boradi.
 
 Foydalanuvchi tug'ilgan sanani kiritadi, bot yoshni avtomatik hisoblaydi. Rasm yuborishdan
 oldin ariza ma'lumotlarini tekshirib, kerak bo'lsa tahrirlashi mumkin.

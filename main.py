@@ -280,7 +280,7 @@ def init_db() -> None:
                 fariks_duration TEXT NOT NULL DEFAULT '',
                 motivation TEXT NOT NULL DEFAULT '',
                 recent_photo_json TEXT NOT NULL DEFAULT '{}',
-                role TEXT NOT NULL DEFAULT 'employee',
+                role TEXT NOT NULL DEFAULT 'Admin',
                 age TEXT NOT NULL DEFAULT '',
                 direction TEXT NOT NULL DEFAULT '',
                 certificates_json TEXT NOT NULL DEFAULT '[]',
@@ -318,7 +318,7 @@ def init_db() -> None:
                 "fariks_duration": "TEXT NOT NULL DEFAULT ''",
                 "motivation": "TEXT NOT NULL DEFAULT ''",
                 "recent_photo_json": "TEXT NOT NULL DEFAULT '{}'",
-                "role": "TEXT NOT NULL DEFAULT 'employee'",
+                "role": "TEXT NOT NULL DEFAULT 'Admin'",
                 "age": "TEXT NOT NULL DEFAULT ''",
                 "direction": "TEXT NOT NULL DEFAULT ''",
                 "certificates_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -516,6 +516,15 @@ def get_all_application_rows() -> list[sqlite3.Row]:
         return list(connection.execute("SELECT * FROM applications ORDER BY id"))
 
 
+def get_approved_application_rows() -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                "SELECT * FROM applications WHERE status = 'approved' ORDER BY id"
+            )
+        )
+
+
 def get_application_rows_by_status(status: str, limit: int = 10) -> list[sqlite3.Row]:
     with db_connect() as connection:
         return list(
@@ -577,7 +586,7 @@ def create_application(user, user_data: dict) -> int:
                 fariks_duration, motivation, recent_photo_json, role, age, direction,
                 certificates_json, certificate_count, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'employee', ?, ?, '[]', 0, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 0, 'pending', ?)
             """,
             (
                 user.id,
@@ -604,6 +613,7 @@ def create_application(user, user_data: dict) -> int:
                 user_data["fariks_duration"],
                 user_data["motivation"],
                 json.dumps(photo, ensure_ascii=False),
+                user_data["job_direction"],
                 user_data.get("age", ""),
                 user_data["branch"],
                 now_iso(),
@@ -683,6 +693,31 @@ def get_application_admin_messages(application_id: int) -> list[dict]:
         return []
 
 
+def normalize_job_direction(row_data: dict) -> str:
+    raw_direction = (row_data.get("job_direction") or "").strip()
+    raw_role = (row_data.get("role") or "").strip()
+    valid_directions = set(JOB_DIRECTION_LABELS.values())
+
+    if raw_direction in valid_directions:
+        return raw_direction
+
+    role_map = {
+        "admin": "Admin",
+        "Admin": "Admin",
+        "employee": "Admin",
+        "teacher": "O'qituvchi",
+        "O'qituvchi": "O'qituvchi",
+        "assistant": "O'qituvchi yordamchi",
+        "O'qituvchi yordamchi": "O'qituvchi yordamchi",
+    }
+    if raw_role in role_map:
+        return role_map[raw_role]
+
+    if raw_direction:
+        return role_map.get(raw_direction, raw_direction)
+    return "Admin"
+
+
 def row_to_application(row: sqlite3.Row | dict) -> dict:
     row_data = dict(row)
     return {
@@ -695,7 +730,7 @@ def row_to_application(row: sqlite3.Row | dict) -> dict:
         "address": row_data.get("address", ""),
         "branch": row_data.get("branch", "") or row_data.get("direction", ""),
         "education": row_data.get("education", ""),
-        "job_direction": row_data.get("job_direction", "") or row_data.get("role", ""),
+        "job_direction": normalize_job_direction(row_data),
         "specialty": row_data.get("specialty", ""),
         "phone": row_data.get("phone", ""),
         "experience": row_data.get("experience", ""),
@@ -2065,14 +2100,11 @@ def sync_excel_file(
     image_paths = image_paths or {}
 
     headers = [
-        "ID",
-        "Sana",
-        "Holat",
-        "Telegram ID",
-        "Username",
+        "No",
         "Ism-sharif",
         "Tug'ilgan sana",
         "Yosh",
+        "Telefon",
         "Manzil",
         "Filial",
         "Ma'lumot",
@@ -2090,31 +2122,24 @@ def sync_excel_file(
         "Tillar",
         "Fariksda ishlash niyati",
         "Nega Fariks",
-        "Telefon",
         "Rasm",
-        "Rad sababi",
-        "Qaror sanasi",
-        "Qaror qilgan admin",
     ]
     last_column = get_column_letter(len(headers))
     sheet.append(headers)
     image_column = headers.index("Rasm") + 1
-    application_rows = rows if rows is not None else get_all_application_rows()
+    application_rows = rows if rows is not None else get_approved_application_rows()
     header_row = 1
 
-    for row in application_rows:
+    for index, row in enumerate(application_rows, start=1):
         application = row_to_application(row)
         photo_exists = bool((application.get("recent_photo") or {}).get("file_id"))
         sheet.append(
             [
-                application["id"],
-                format_iso_datetime(application["created_at"]),
-                status_label(application["status"]),
-                application["user_id"],
-                application["username"] or "",
+                index,
                 application["full_name"],
                 application["birth_date"],
                 application["age"],
+                application["phone"],
                 application["address"],
                 application["branch"],
                 application["education"],
@@ -2132,21 +2157,17 @@ def sync_excel_file(
                 application["languages"],
                 application["fariks_duration"],
                 application["motivation"],
-                application["phone"],
                 "" if image_paths.get(application["id"]) else ("Rasm bor" if photo_exists else "Rasm yo'q"),
-                application["reject_reason"],
-                format_iso_datetime(application.get("decided_at") or ""),
-                application.get("decided_by") or "",
             ]
         )
         row_number = sheet.max_row
         image_path = image_paths.get(application["id"])
         if image_path:
             excel_image = ExcelImage(str(image_path))
-            excel_image.width = 72
-            excel_image.height = 72
+            excel_image.width = 105
+            excel_image.height = 105
             sheet.add_image(excel_image, f"{get_column_letter(image_column)}{row_number}")
-            sheet.row_dimensions[row_number].height = 58
+            sheet.row_dimensions[row_number].height = 82
             sheet.cell(row=row_number, column=image_column).alignment = Alignment(
                 horizontal="center",
                 vertical="center",
@@ -2167,12 +2188,6 @@ def apply_excel_design(sheet, headers: list[str], header_row: int, image_column:
     thin_side = Side(style="thin", color="D9D9D9")
     border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
     row_fill = PatternFill("solid", fgColor="FFFFFF")
-    status_fills = {
-        "Kutilmoqda": PatternFill("solid", fgColor="FFF2CC"),
-        "Tasdiqlangan": PatternFill("solid", fgColor="D9EAD3"),
-        "Rad etilgan": PatternFill("solid", fgColor="F4CCCC"),
-        "Ko'rib chiqilmoqda": PatternFill("solid", fgColor="D9EAF7"),
-    }
 
     for cell in sheet[header_row]:
         cell.fill = header_fill
@@ -2181,28 +2196,18 @@ def apply_excel_design(sheet, headers: list[str], header_row: int, image_column:
         cell.border = border
     sheet.row_dimensions[header_row].height = 24
 
-    status_column = headers.index("Holat") + 1
     for row_number in range(header_row + 1, sheet.max_row + 1):
         for cell in sheet[row_number]:
             cell.fill = row_fill
             cell.border = border
             cell.alignment = Alignment(vertical="top", wrap_text=True)
 
-        status_cell = sheet.cell(row=row_number, column=status_column)
-        if status_cell.value in status_fills:
-            status_cell.fill = status_fills[status_cell.value]
-            status_cell.font = Font(bold=True)
-            status_cell.alignment = Alignment(horizontal="center", vertical="center")
-
     width_by_header = {
-        "ID": 6,
-        "Sana": 16,
-        "Holat": 16,
-        "Telegram ID": 14,
-        "Username": 16,
+        "No": 6,
         "Ism-sharif": 24,
         "Tug'ilgan sana": 14,
         "Yosh": 7,
+        "Telefon": 18,
         "Manzil": 28,
         "Filial": 20,
         "Ma'lumot": 18,
@@ -2220,19 +2225,15 @@ def apply_excel_design(sheet, headers: list[str], header_row: int, image_column:
         "Tillar": 18,
         "Fariksda ishlash niyati": 18,
         "Nega Fariks": 28,
-        "Telefon": 18,
-        "Rasm": 12,
-        "Rad sababi": 24,
-        "Qaror sanasi": 16,
-        "Qaror qilgan admin": 18,
+        "Rasm": 18,
     }
     for index, header in enumerate(headers, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width_by_header.get(header, 18)
-    sheet.column_dimensions[get_column_letter(image_column)].width = 12
+    sheet.column_dimensions[get_column_letter(image_column)].width = 18
 
 
 async def sync_excel_file_with_images(context: ContextTypes.DEFAULT_TYPE) -> Path:
-    rows = get_all_application_rows()
+    rows = get_approved_application_rows()
     with TemporaryDirectory() as temp_dir:
         image_paths = await download_excel_images(context, rows, Path(temp_dir))
         return sync_excel_file(rows=rows, image_paths=image_paths)
@@ -2274,8 +2275,8 @@ def resize_image_for_excel(source_path: Path, target_path: Path) -> None:
         image = ImageOps.exif_transpose(image)
         if image.mode not in {"RGB", "L"}:
             image = image.convert("RGB")
-        image = ImageOps.fit(image, (120, 120), method=PILImage.Resampling.LANCZOS)
-        image.save(target_path, format="JPEG", quality=82)
+        image = ImageOps.fit(image, (180, 180), method=PILImage.Resampling.LANCZOS)
+        image.save(target_path, format="JPEG", quality=90)
 
 
 def safe_sync_excel_file() -> Path | None:

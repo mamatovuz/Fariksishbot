@@ -19,6 +19,8 @@ from PIL import Image as PILImage, ImageOps
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
@@ -1737,6 +1739,33 @@ async def send_application_to_chat(
     certificate_image = application.get("certificate_image") or {}
     sent_messages = []
 
+    if image and certificate_image:
+        album_caption = caption if len(caption) <= 1024 else limit_telegram_text(caption, 1024)
+        album_messages = await send_image_album(
+            context=context,
+            chat_id=chat_id,
+            images=[image, certificate_image],
+            caption=album_caption,
+        )
+        sent_messages.extend(album_messages)
+
+        if len(caption) > 1024:
+            text_message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=limit_telegram_text(caption),
+                reply_markup=reply_markup,
+            )
+            sent_messages.append(text_message)
+        elif reply_markup:
+            control_message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Ariza #{application['id']} bo'yicha qaror tanlang:",
+                reply_markup=reply_markup,
+            )
+            sent_messages.append(control_message)
+
+        return sent_messages
+
     if not image:
         message = await context.bot.send_message(
             chat_id=chat_id,
@@ -1772,6 +1801,41 @@ async def send_application_to_chat(
         sent_messages.append(certificate_message)
 
     return sent_messages
+
+
+async def send_image_album(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: str,
+    images: list[dict],
+    caption: str,
+) -> list:
+    try:
+        return await context.bot.send_media_group(
+            chat_id=chat_id,
+            media=[
+                build_album_media(image, caption if index == 0 else None)
+                for index, image in enumerate(images)
+            ],
+        )
+    except Exception as error:
+        logger.warning("Album yuborishda xatolik: %s", format_runtime_error(error))
+        sent_messages = []
+        for index, image in enumerate(images):
+            sent_messages.append(
+                await send_single_image(
+                    context=context,
+                    chat_id=chat_id,
+                    image=image,
+                    caption=caption if index == 0 else None,
+                )
+            )
+        return sent_messages
+
+
+def build_album_media(image: dict, caption: str | None):
+    if image.get("type") == "photo":
+        return InputMediaPhoto(media=image["file_id"], caption=caption)
+    return InputMediaDocument(media=image["file_id"], caption=caption)
 
 
 async def send_single_image(
@@ -2033,22 +2097,10 @@ def sync_excel_file(
         "Qaror qilgan admin",
     ]
     last_column = get_column_letter(len(headers))
-    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
-    sheet["A1"] = "Fariks ishga arizalar"
-    sheet["A1"].font = Font(bold=True, color="FFFFFF", size=14)
-    sheet["A1"].fill = PatternFill("solid", fgColor="305496")
-    sheet["A1"].alignment = Alignment(horizontal="center", vertical="center")
-    sheet.row_dimensions[1].height = 28
-
-    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
-    sheet["A2"] = f"Yaratilgan vaqt: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-    sheet["A2"].font = Font(italic=True, color="666666")
-    sheet["A2"].alignment = Alignment(horizontal="right")
-
     sheet.append(headers)
     image_column = headers.index("Rasm") + 1
     application_rows = rows if rows is not None else get_all_application_rows()
-    header_row = 3
+    header_row = 1
 
     for row in application_rows:
         application = row_to_application(row)
@@ -2102,7 +2154,7 @@ def sync_excel_file(
 
     apply_excel_design(sheet, headers, header_row, image_column)
 
-    sheet.freeze_panes = "A4"
+    sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = f"A{header_row}:{last_column}{sheet.max_row}"
 
     workbook.save(EXCEL_FILE)
@@ -2110,12 +2162,11 @@ def sync_excel_file(
 
 
 def apply_excel_design(sheet, headers: list[str], header_row: int, image_column: int) -> None:
-    header_fill = PatternFill("solid", fgColor="305496")
-    header_font = Font(bold=True, color="FFFFFF")
-    thin_side = Side(style="thin", color="D9E2F3")
+    header_fill = PatternFill("solid", fgColor="D9EAF7")
+    header_font = Font(bold=True, color="1F1F1F")
+    thin_side = Side(style="thin", color="D9D9D9")
     border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-    odd_fill = PatternFill("solid", fgColor="F7FAFC")
-    even_fill = PatternFill("solid", fgColor="FFFFFF")
+    row_fill = PatternFill("solid", fgColor="FFFFFF")
     status_fills = {
         "Kutilmoqda": PatternFill("solid", fgColor="FFF2CC"),
         "Tasdiqlangan": PatternFill("solid", fgColor="D9EAD3"),
@@ -2128,11 +2179,10 @@ def apply_excel_design(sheet, headers: list[str], header_row: int, image_column:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = border
-    sheet.row_dimensions[header_row].height = 26
+    sheet.row_dimensions[header_row].height = 24
 
     status_column = headers.index("Holat") + 1
     for row_number in range(header_row + 1, sheet.max_row + 1):
-        row_fill = odd_fill if row_number % 2 else even_fill
         for cell in sheet[row_number]:
             cell.fill = row_fill
             cell.border = border

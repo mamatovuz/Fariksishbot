@@ -2398,7 +2398,6 @@ def build_admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🏢 Filial filter", callback_data="admin:filter_branch"),
                 InlineKeyboardButton("📊 Excel", callback_data="admin:excel"),
             ],
-            [InlineKeyboardButton("🔄 Yangilash", callback_data="admin:refresh")],
         ]
     )
 

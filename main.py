@@ -15,7 +15,7 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageOps
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -43,6 +43,8 @@ DEFAULT_ADMIN_CHAT_ID = "7903688837"
 DEFAULT_PUBLISH_CHAT_ID = "-1003994819171"
 DEFAULT_DB_FILE = "bot.db"
 DEFAULT_EXCEL_FILE = "applications.xlsx"
+DEFAULT_REQUIRED_CHANNEL = "@fariks01"
+DEFAULT_REQUIRED_CHANNEL_URL = "https://t.me/fariks01"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or DEFAULT_BOT_TOKEN
 ADMIN_IDS_TEXT = os.getenv("ADMIN_IDS") or DEFAULT_ADMIN_IDS
@@ -59,6 +61,8 @@ ADMIN_IDS = {
 }
 DB_FILE = Path(os.getenv("DB_FILE") or DEFAULT_DB_FILE)
 EXCEL_FILE = Path(os.getenv("EXCEL_FILE") or DEFAULT_EXCEL_FILE)
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL") or DEFAULT_REQUIRED_CHANNEL
+REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL") or DEFAULT_REQUIRED_CHANNEL_URL
 
 (
     FULL_NAME,
@@ -66,8 +70,12 @@ EXCEL_FILE = Path(os.getenv("EXCEL_FILE") or DEFAULT_EXCEL_FILE)
     ADDRESS,
     BRANCH,
     EDUCATION,
+    JOB_DIRECTION,
+    SPECIALTY,
     EXPERIENCE_CHOICE,
     EXPERIENCE_YEARS,
+    CERTIFICATE_CHOICE,
+    CERTIFICATE_PHOTO,
     PREVIOUS_JOB,
     CONVICTED,
     FAMILY_STATUS,
@@ -82,7 +90,7 @@ EXCEL_FILE = Path(os.getenv("EXCEL_FILE") or DEFAULT_EXCEL_FILE)
     RECENT_PHOTO,
     REVIEW_APPLICATION,
     EDIT_FIELD,
-) = range(21)
+) = range(25)
 ADD_ADMIN_TARGET, REMOVE_ADMIN_TARGET, SEARCH_APPLICATION_TARGET, FILTER_BRANCH_TARGET = range(100, 104)
 
 EDUCATION_LABELS = {
@@ -99,6 +107,17 @@ YES_NO_LABELS = {
     "yes": "Ha",
     "no": "Yo'q",
 }
+JOB_DIRECTION_LABELS = {
+    "admin": "Admin",
+    "teacher": "O'qituvchi",
+    "assistant": "O'qituvchi yordamchi",
+}
+SPECIALTY_LABELS = {
+    "math": "Matematika",
+    "physics": "Fizika",
+    "russian": "Rus tili",
+    "english": "Ingliz tili",
+}
 
 EDUCATION_KEYBOARD = InlineKeyboardMarkup(
     [
@@ -106,11 +125,38 @@ EDUCATION_KEYBOARD = InlineKeyboardMarkup(
         [InlineKeyboardButton("🏥 O'rta maxsus", callback_data="education:secondary")],
     ]
 )
+JOB_DIRECTION_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("🛠 Admin", callback_data="job:admin")],
+        [InlineKeyboardButton("👨‍🏫 O'qituvchi", callback_data="job:teacher")],
+        [InlineKeyboardButton("🤝 O'qituvchi yordamchi", callback_data="job:assistant")],
+    ]
+)
+SPECIALTY_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("📐 Matematika", callback_data="specialty:math"),
+            InlineKeyboardButton("⚛️ Fizika", callback_data="specialty:physics"),
+        ],
+        [
+            InlineKeyboardButton("🇷🇺 Rus tili", callback_data="specialty:russian"),
+            InlineKeyboardButton("🇬🇧 Ingliz tili", callback_data="specialty:english"),
+        ],
+    ]
+)
 EXPERIENCE_INLINE_KEYBOARD = InlineKeyboardMarkup(
     [
         [
             InlineKeyboardButton("✅ Ha", callback_data="exp:yes"),
             InlineKeyboardButton("❌ Yo'q", callback_data="exp:no"),
+        ]
+    ]
+)
+CERTIFICATE_CHOICE_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("✅ Bor", callback_data="cert:yes"),
+            InlineKeyboardButton("❌ Yo'q", callback_data="cert:no"),
         ]
     ]
 )
@@ -215,8 +261,12 @@ def init_db() -> None:
                 address TEXT NOT NULL DEFAULT '',
                 branch TEXT NOT NULL DEFAULT '',
                 education TEXT NOT NULL DEFAULT '',
+                job_direction TEXT NOT NULL DEFAULT '',
+                specialty TEXT NOT NULL DEFAULT '',
                 phone TEXT NOT NULL,
                 experience TEXT NOT NULL,
+                certificate_status TEXT NOT NULL DEFAULT '',
+                certificate_json TEXT NOT NULL DEFAULT '{}',
                 previous_job TEXT NOT NULL DEFAULT '',
                 convicted TEXT NOT NULL DEFAULT '',
                 family_status TEXT NOT NULL DEFAULT '',
@@ -252,6 +302,10 @@ def init_db() -> None:
                 "address": "TEXT NOT NULL DEFAULT ''",
                 "branch": "TEXT NOT NULL DEFAULT ''",
                 "education": "TEXT NOT NULL DEFAULT ''",
+                "job_direction": "TEXT NOT NULL DEFAULT ''",
+                "specialty": "TEXT NOT NULL DEFAULT ''",
+                "certificate_status": "TEXT NOT NULL DEFAULT ''",
+                "certificate_json": "TEXT NOT NULL DEFAULT '{}'",
                 "previous_job": "TEXT NOT NULL DEFAULT ''",
                 "convicted": "TEXT NOT NULL DEFAULT ''",
                 "family_status": "TEXT NOT NULL DEFAULT ''",
@@ -481,10 +535,12 @@ def search_application_rows(query: str, limit: int = 10) -> list[sqlite3.Row]:
                    OR phone LIKE ?
                    OR branch LIKE ?
                    OR username LIKE ?
+                   OR job_direction LIKE ?
+                   OR specialty LIKE ?
                 ORDER BY id DESC
                 LIMIT ?
                 """,
-                (like_query, like_query, like_query, like_query, limit),
+                (like_query, like_query, like_query, like_query, like_query, like_query, limit),
             )
         )
 
@@ -507,17 +563,19 @@ def get_application_rows_by_branch(branch_query: str, limit: int = 10) -> list[s
 
 def create_application(user, user_data: dict) -> int:
     photo = user_data.get("recent_photo", {})
+    certificate = user_data.get("certificate_image", {})
     with db_connect() as connection:
         cursor = connection.execute(
             """
             INSERT INTO applications (
                 user_id, username, full_name, birth_date, address, branch, education,
-                phone, experience, previous_job, convicted, family_status,
+                job_direction, specialty, phone, experience, certificate_status,
+                certificate_json, previous_job, convicted, family_status,
                 previous_salary, expected_salary, word_level, excel_level, languages,
                 fariks_duration, motivation, recent_photo_json, role, age, direction,
                 certificates_json, certificate_count, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'employee', ?, ?, '[]', 0, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'employee', ?, ?, '[]', 0, 'pending', ?)
             """,
             (
                 user.id,
@@ -527,8 +585,12 @@ def create_application(user, user_data: dict) -> int:
                 user_data["address"],
                 user_data["branch"],
                 user_data["education"],
+                user_data["job_direction"],
+                user_data.get("specialty", ""),
                 user_data["phone"],
                 user_data["experience"],
+                user_data.get("certificate_status", ""),
+                json.dumps(certificate, ensure_ascii=False),
                 user_data["previous_job"],
                 user_data["convicted"],
                 user_data["family_status"],
@@ -631,8 +693,12 @@ def row_to_application(row: sqlite3.Row | dict) -> dict:
         "address": row_data.get("address", ""),
         "branch": row_data.get("branch", "") or row_data.get("direction", ""),
         "education": row_data.get("education", ""),
+        "job_direction": row_data.get("job_direction", "") or row_data.get("role", ""),
+        "specialty": row_data.get("specialty", ""),
         "phone": row_data.get("phone", ""),
         "experience": row_data.get("experience", ""),
+        "certificate_status": row_data.get("certificate_status", ""),
+        "certificate_image": json.loads(row_data.get("certificate_json") or "{}"),
         "previous_job": row_data.get("previous_job", ""),
         "convicted": row_data.get("convicted", ""),
         "family_status": row_data.get("family_status", ""),
@@ -658,6 +724,36 @@ def main_keyboard_for(user_id: int) -> ReplyKeyboardMarkup | ReplyKeyboardRemove
     return ReplyKeyboardRemove()
 
 
+def build_subscription_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📢 Kanalga obuna bo'lish", url=REQUIRED_CHANNEL_URL)],
+            [InlineKeyboardButton("✅ Obunani tekshirish", callback_data="sub:check")],
+        ]
+    )
+
+
+async def is_user_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    if not REQUIRED_CHANNEL:
+        return True
+
+    try:
+        member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+    except Exception as error:
+        logger.warning("Obunani tekshirishda xatolik: %s", format_runtime_error(error))
+        return False
+
+    return member.status in {"creator", "administrator", "member"}
+
+
+async def prompt_subscription(message) -> None:
+    await message.reply_text(
+        "📢 Ariza topshirish uchun avval Fariks kanaliga obuna bo'ling.\n"
+        "Obuna bo'lgach, pastdagi \"✅ Obunani tekshirish\" tugmasini bosing.",
+        reply_markup=build_subscription_keyboard(),
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     upsert_user(update.effective_user)
 
@@ -668,19 +764,48 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
 
-    return await begin_application(update, context)
+    if not await is_user_subscribed(context, update.effective_user.id):
+        await prompt_subscription(update.message)
+        return ConversationHandler.END
+
+    return await launch_application(update.message, context)
 
 
 async def begin_application(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     upsert_user(update.effective_user)
+    if not is_admin(update.effective_user.id):
+        if not await is_user_subscribed(context, update.effective_user.id):
+            await prompt_subscription(update.message)
+            return ConversationHandler.END
+
+    return await launch_application(update.message, context)
+
+
+async def subscription_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    upsert_user(query.from_user)
+    await query.answer()
+
+    if not await is_user_subscribed(context, query.from_user.id):
+        await query.message.reply_text(
+            "Hali kanalga obuna bo'lmagansiz. Iltimos, avval kanalga obuna bo'ling.",
+            reply_markup=build_subscription_keyboard(),
+        )
+        return ConversationHandler.END
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    return await launch_application(query.message, context)
+
+
+async def launch_application(message, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
 
-    await update.message.reply_text(
+    await message.reply_text(
         "Assalomu alaykum! 👋\n"
         "Fariks jamoasiga ishga ariza topshirish uchun savollarga javob bering.",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await update.message.reply_text("1. 👤 Ism-sharifingizni yozing.")
+    await message.reply_text("1. 👤 Ism-sharifingizni yozing.")
     return FULL_NAME
 
 
@@ -760,8 +885,11 @@ async def education_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     key = query.data.split(":", 1)[1]
     context.user_data["education"] = EDUCATION_LABELS[key]
     await query.edit_message_text(f"5. 🎓 Ma'lumot: {EDUCATION_LABELS[key]}")
-    await ask_experience(query.message)
-    return EXPERIENCE_CHOICE
+    await query.message.reply_text(
+        "6. 🚩 Yo'nalishingizni belgilang.",
+        reply_markup=JOB_DIRECTION_KEYBOARD,
+    )
+    return JOB_DIRECTION
 
 
 async def invalid_education(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -771,6 +899,58 @@ async def invalid_education(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         reply_markup=EDUCATION_KEYBOARD,
     )
     return EDUCATION
+
+
+async def job_direction_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    key = query.data.split(":", 1)[1]
+    context.user_data["job_direction"] = JOB_DIRECTION_LABELS[key]
+    context.user_data["job_direction_key"] = key
+    await query.edit_message_text(f"6. 🚩 Yo'nalish: {JOB_DIRECTION_LABELS[key]}")
+
+    if key == "admin":
+        context.user_data["specialty"] = ""
+        context.user_data["certificate_status"] = ""
+        context.user_data["certificate_image"] = {}
+        await ask_experience(query.message)
+        return EXPERIENCE_CHOICE
+
+    await query.message.reply_text(
+        "7. 📚 Mutaxassisligingizni tanlang.",
+        reply_markup=SPECIALTY_KEYBOARD,
+    )
+    return SPECIALTY
+
+
+async def invalid_job_direction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await reply_to_update(
+        update,
+        "Iltimos, yo'nalishni tugmalardan tanlang.",
+        reply_markup=JOB_DIRECTION_KEYBOARD,
+    )
+    return JOB_DIRECTION
+
+
+async def specialty_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    key = query.data.split(":", 1)[1]
+    context.user_data["specialty"] = SPECIALTY_LABELS[key]
+    await query.edit_message_text(f"7. 📚 Mutaxassislik: {SPECIALTY_LABELS[key]}")
+    await query.message.reply_text("8. 💼 Ushbu yo'nalishda tajribangiz necha yil?")
+    return EXPERIENCE_YEARS
+
+
+async def invalid_specialty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await reply_to_update(
+        update,
+        "Iltimos, mutaxassislikni tugmalardan tanlang.",
+        reply_markup=SPECIALTY_KEYBOARD,
+    )
+    return SPECIALTY
 
 
 async def ask_experience(message) -> None:
@@ -823,10 +1003,70 @@ async def experience_years(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         value = f"{value} yil"
 
     context.user_data["experience"] = value
+    if context.user_data.get("job_direction_key") in {"teacher", "assistant"}:
+        await update.message.reply_text(
+            "9. 📜 Sertifikatingiz bormi?",
+            reply_markup=CERTIFICATE_CHOICE_KEYBOARD,
+        )
+        return CERTIFICATE_CHOICE
+
     await update.message.reply_text(
         "7. 🏬 Oldingi ish joyingizda necha yil ishlagansiz?\nLavozimingizni ham yozishingiz mumkin."
     )
     return PREVIOUS_JOB
+
+
+async def certificate_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data.split(":", 1)[1]
+    await query.edit_message_reply_markup(reply_markup=None)
+    if choice == "yes":
+        context.user_data["certificate_status"] = "Bor"
+        await query.message.reply_text("📜 Sertifikat rasmini yuboring.")
+        return CERTIFICATE_PHOTO
+
+    context.user_data["certificate_status"] = "Yo'q"
+    context.user_data["certificate_image"] = {}
+    await query.message.reply_text("📜 Sertifikat: Yo'q")
+    await query.message.reply_text(
+        "10. 🏬 Oldingi ish joyingizda necha yil ishlagansiz?\nLavozimingizni ham yozishingiz mumkin."
+    )
+    return PREVIOUS_JOB
+
+
+async def invalid_certificate_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await reply_to_update(
+        update,
+        "Iltimos, sertifikat bor yoki yo'qligini tugma orqali tanlang.",
+        reply_markup=CERTIFICATE_CHOICE_KEYBOARD,
+    )
+    return CERTIFICATE_CHOICE
+
+
+async def certificate_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    image = get_image_info(update)
+    if not image:
+        await update.message.reply_text("Iltimos, sertifikat rasmini yuboring.")
+        return CERTIFICATE_PHOTO
+
+    context.user_data["certificate_status"] = "Bor"
+    context.user_data["certificate_image"] = image
+    await update.message.reply_text("✅ Sertifikat rasmi qabul qilindi.")
+    if context.user_data.pop("return_to_review_after_certificate", None):
+        await show_application_review(update.message, context)
+        return REVIEW_APPLICATION
+
+    await update.message.reply_text(
+        "10. 🏬 Oldingi ish joyingizda necha yil ishlagansiz?\nLavozimingizni ham yozishingiz mumkin."
+    )
+    return PREVIOUS_JOB
+
+
+async def invalid_certificate_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Iltimos, sertifikat rasmini yuboring.")
+    return CERTIFICATE_PHOTO
 
 
 async def previous_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1015,6 +1255,9 @@ def build_edit_fields_keyboard() -> InlineKeyboardMarkup:
         ("📍 Manzil", "address"),
         ("🏢 Filial", "branch"),
         ("🎓 Ma'lumot", "education"),
+        ("🚩 Yo'nalish", "job_direction"),
+        ("📚 Mutaxassislik", "specialty"),
+        ("📜 Sertifikat", "certificate_status"),
         ("💼 Tajriba", "experience"),
         ("🏬 Oldingi ish", "previous_job"),
         ("⚖️ Sudlangan", "convicted"),
@@ -1059,6 +1302,39 @@ def build_edit_value_keyboard(field: str) -> InlineKeyboardMarkup:
             ]
         )
 
+    if field == "job_direction":
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🛠 Admin", callback_data="editval:job_direction:admin")],
+                [InlineKeyboardButton("👨‍🏫 O'qituvchi", callback_data="editval:job_direction:teacher")],
+                [InlineKeyboardButton("🤝 O'qituvchi yordamchi", callback_data="editval:job_direction:assistant")],
+            ]
+        )
+
+    if field == "specialty":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("📐 Matematika", callback_data="editval:specialty:math"),
+                    InlineKeyboardButton("⚛️ Fizika", callback_data="editval:specialty:physics"),
+                ],
+                [
+                    InlineKeyboardButton("🇷🇺 Rus tili", callback_data="editval:specialty:russian"),
+                    InlineKeyboardButton("🇬🇧 Ingliz tili", callback_data="editval:specialty:english"),
+                ],
+            ]
+        )
+
+    if field == "certificate_status":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ Bor", callback_data="editval:certificate_status:yes"),
+                    InlineKeyboardButton("❌ Yo'q", callback_data="editval:certificate_status:no"),
+                ]
+            ]
+        )
+
     if field in {"word_level", "excel_level"}:
         prefix = "word_level" if field == "word_level" else "excel_level"
         return InlineKeyboardMarkup(
@@ -1078,7 +1354,7 @@ def build_edit_value_keyboard(field: str) -> InlineKeyboardMarkup:
 
 
 def build_review_text(data: dict) -> str:
-    return (
+    text = (
         "📋 Arizangizni tekshirib chiqing:\n\n"
         f"👤 Ism-sharif: {data.get('full_name', '')}\n"
         f"🎂 Tug'ilgan sana: {data.get('birth_date', '')}\n"
@@ -1086,6 +1362,14 @@ def build_review_text(data: dict) -> str:
         f"📍 Manzil: {data.get('address', '')}\n"
         f"🏢 Filial: {data.get('branch', '')}\n"
         f"🎓 Ma'lumot: {data.get('education', '')}\n"
+        f"🚩 Yo'nalish: {data.get('job_direction', '')}\n"
+    )
+    if data.get("specialty"):
+        text += f"📚 Mutaxassislik: {data.get('specialty', '')}\n"
+    if data.get("certificate_status"):
+        text += f"📜 Sertifikat: {data.get('certificate_status', '')}\n"
+
+    text += (
         f"💼 Soha tajribasi: {data.get('experience', '')}\n"
         f"🏬 Oldingi ish joyi: {data.get('previous_job', '')}\n"
         f"⚖️ Sudlangan: {data.get('convicted', '')}\n"
@@ -1099,6 +1383,7 @@ def build_review_text(data: dict) -> str:
         f"❓ Nega Fariks: {data.get('motivation', '')}\n"
         f"📞 Telefon: {data.get('phone', '')}"
     )
+    return text
 
 
 async def show_application_review(message, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1115,6 +1400,11 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     action = query.data.split(":", 1)[1]
     if action == "confirm":
         await query.edit_message_reply_markup(reply_markup=None)
+        if needs_certificate_image(context.user_data):
+            context.user_data["return_to_review_after_certificate"] = True
+            await query.message.reply_text("📜 Sertifikat rasmini yuboring.")
+            return CERTIFICATE_PHOTO
+
         await query.message.reply_text("18. 📷 Oxirgi 1 oy ichida tushgan rasmingizni yuboring.")
         return RECENT_PHOTO
 
@@ -1135,6 +1425,17 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 
+def needs_certificate_image(data: dict) -> bool:
+    is_teacher_direction = data.get("job_direction_key") in {"teacher", "assistant"} or data.get(
+        "job_direction"
+    ) in {"O'qituvchi", "O'qituvchi yordamchi"}
+    return (
+        is_teacher_direction
+        and data.get("certificate_status") == "Bor"
+        and not data.get("certificate_image")
+    )
+
+
 async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -1145,7 +1446,15 @@ async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_application_review(query.message, context)
         return REVIEW_APPLICATION
 
-    if field in {"education", "convicted", "word_level", "excel_level"}:
+    if field in {
+        "education",
+        "convicted",
+        "word_level",
+        "excel_level",
+        "job_direction",
+        "specialty",
+        "certificate_status",
+    }:
         await query.message.reply_text(
             edit_field_prompt(field),
             reply_markup=build_edit_value_keyboard(field),
@@ -1164,6 +1473,19 @@ async def edit_value_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     _, field, key = query.data.split(":")
     if field == "education":
         context.user_data[field] = EDUCATION_LABELS[key]
+    elif field == "job_direction":
+        context.user_data[field] = JOB_DIRECTION_LABELS[key]
+        context.user_data["job_direction_key"] = key
+        if key == "admin":
+            context.user_data["specialty"] = ""
+            context.user_data["certificate_status"] = ""
+            context.user_data["certificate_image"] = {}
+    elif field == "specialty":
+        context.user_data[field] = SPECIALTY_LABELS[key]
+    elif field == "certificate_status":
+        context.user_data[field] = "Bor" if key == "yes" else "Yo'q"
+        if key == "no":
+            context.user_data["certificate_image"] = {}
     elif field == "convicted":
         context.user_data[field] = YES_NO_LABELS[key]
     elif field in {"word_level", "excel_level"}:
@@ -1217,6 +1539,9 @@ def edit_field_prompt(field: str) -> str:
         "address": "Yangi yashash manzilini yozing.",
         "branch": "Yangi filial shahar yoki tuman nomini yozing.",
         "education": "Yangi ma'lumot darajasini tanlang.",
+        "job_direction": "Yangi yo'nalishni tanlang.",
+        "specialty": "Yangi mutaxassislikni tanlang.",
+        "certificate_status": "Sertifikat bor yoki yo'qligini tanlang.",
         "experience": "Yangi tajribani yozing. Masalan: 3 yil",
         "previous_job": "Oldingi ish joyi haqida yangi ma'lumot yozing.",
         "convicted": "Sudlanganlik holatini tanlang.",
@@ -1296,6 +1621,7 @@ async def finish_application(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "address",
         "branch",
         "education",
+        "job_direction",
         "experience",
         "previous_job",
         "convicted",
@@ -1310,6 +1636,15 @@ async def finish_application(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "phone",
         "recent_photo",
     ]
+    is_teacher_direction = context.user_data.get("job_direction_key") in {
+        "teacher",
+        "assistant",
+    } or context.user_data.get("job_direction") in {"O'qituvchi", "O'qituvchi yordamchi"}
+    if is_teacher_direction:
+        required_fields.extend(["specialty", "certificate_status"])
+        if context.user_data.get("certificate_status") == "Bor":
+            required_fields.append("certificate_image")
+
     if any(not context.user_data.get(field) for field in required_fields):
         await reply_to_update(update, "Ariza ma'lumotlari to'liq emas. /start orqali qayta boshlang.")
         context.user_data.clear()
@@ -1399,6 +1734,8 @@ async def send_application_to_chat(
 ) -> list:
     caption = build_application_caption(application)
     image = application.get("recent_photo") or {}
+    certificate_image = application.get("certificate_image") or {}
+    sent_messages = []
 
     if not image:
         message = await context.bot.send_message(
@@ -1406,9 +1743,8 @@ async def send_application_to_chat(
             text=limit_telegram_text(caption),
             reply_markup=reply_markup,
         )
-        return [message]
-
-    if len(caption) <= 1024:
+        sent_messages.append(message)
+    elif len(caption) <= 1024:
         message = await send_single_image(
             context=context,
             chat_id=chat_id,
@@ -1416,15 +1752,26 @@ async def send_application_to_chat(
             caption=caption,
             reply_markup=reply_markup,
         )
-        return [message]
+        sent_messages.append(message)
+    else:
+        image_message = await send_single_image(context=context, chat_id=chat_id, image=image, caption=None)
+        text_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=limit_telegram_text(caption),
+            reply_markup=reply_markup,
+        )
+        sent_messages.extend([image_message, text_message])
 
-    image_message = await send_single_image(context=context, chat_id=chat_id, image=image, caption=None)
-    text_message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=limit_telegram_text(caption),
-        reply_markup=reply_markup,
-    )
-    return [image_message, text_message]
+    if certificate_image:
+        certificate_message = await send_single_image(
+            context=context,
+            chat_id=chat_id,
+            image=certificate_image,
+            caption="📜 Sertifikat",
+        )
+        sent_messages.append(certificate_message)
+
+    return sent_messages
 
 
 async def send_single_image(
@@ -1459,6 +1806,14 @@ def build_application_caption(application: dict) -> str:
         f"📍 Manzil: {application['address']}\n"
         f"🏢 Filial: {application['branch']}\n"
         f"🎓 Ma'lumot: {application['education']}\n"
+        f"🚩 Yo'nalish: {application['job_direction']}\n"
+    )
+    if application.get("specialty"):
+        text += f"📚 Mutaxassislik: {application['specialty']}\n"
+    if application.get("certificate_status"):
+        text += f"📜 Sertifikat: {application['certificate_status']}\n"
+
+    text += (
         f"💼 Soha tajribasi: {application['experience']}\n"
         f"🏬 Oldingi ish joyi: {application['previous_job']}\n"
         f"⚖️ Sudlangan: {application['convicted']}\n"
@@ -1657,7 +2012,10 @@ def sync_excel_file(
         "Manzil",
         "Filial",
         "Ma'lumot",
+        "Yo'nalish",
+        "Mutaxassislik",
         "Soha tajribasi",
+        "Sertifikat",
         "Oldingi ish joyi",
         "Sudlangan",
         "Oilaviy holati",
@@ -1677,8 +2035,8 @@ def sync_excel_file(
     last_column = get_column_letter(len(headers))
     sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
     sheet["A1"] = "Fariks ishga arizalar"
-    sheet["A1"].font = Font(bold=True, color="FFFFFF", size=16)
-    sheet["A1"].fill = PatternFill("solid", fgColor="1F4E78")
+    sheet["A1"].font = Font(bold=True, color="FFFFFF", size=14)
+    sheet["A1"].fill = PatternFill("solid", fgColor="305496")
     sheet["A1"].alignment = Alignment(horizontal="center", vertical="center")
     sheet.row_dimensions[1].height = 28
 
@@ -1694,6 +2052,7 @@ def sync_excel_file(
 
     for row in application_rows:
         application = row_to_application(row)
+        photo_exists = bool((application.get("recent_photo") or {}).get("file_id"))
         sheet.append(
             [
                 application["id"],
@@ -1707,7 +2066,10 @@ def sync_excel_file(
                 application["address"],
                 application["branch"],
                 application["education"],
+                application["job_direction"],
+                application["specialty"],
                 application["experience"],
+                application["certificate_status"],
                 application["previous_job"],
                 application["convicted"],
                 application["family_status"],
@@ -1719,7 +2081,7 @@ def sync_excel_file(
                 application["fariks_duration"],
                 application["motivation"],
                 application["phone"],
-                "" if image_paths.get(application["id"]) else "Rasm yo'q",
+                "" if image_paths.get(application["id"]) else ("Rasm bor" if photo_exists else "Rasm yo'q"),
                 application["reject_reason"],
                 format_iso_datetime(application.get("decided_at") or ""),
                 application.get("decided_by") or "",
@@ -1729,10 +2091,14 @@ def sync_excel_file(
         image_path = image_paths.get(application["id"])
         if image_path:
             excel_image = ExcelImage(str(image_path))
-            excel_image.width = 90
-            excel_image.height = 90
+            excel_image.width = 72
+            excel_image.height = 72
             sheet.add_image(excel_image, f"{get_column_letter(image_column)}{row_number}")
-            sheet.row_dimensions[row_number].height = 75
+            sheet.row_dimensions[row_number].height = 58
+            sheet.cell(row=row_number, column=image_column).alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+            )
 
     apply_excel_design(sheet, headers, header_row, image_column)
 
@@ -1744,11 +2110,11 @@ def sync_excel_file(
 
 
 def apply_excel_design(sheet, headers: list[str], header_row: int, image_column: int) -> None:
-    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_fill = PatternFill("solid", fgColor="305496")
     header_font = Font(bold=True, color="FFFFFF")
     thin_side = Side(style="thin", color="D9E2F3")
     border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-    odd_fill = PatternFill("solid", fgColor="F8FBFF")
+    odd_fill = PatternFill("solid", fgColor="F7FAFC")
     even_fill = PatternFill("solid", fgColor="FFFFFF")
     status_fills = {
         "Kutilmoqda": PatternFill("solid", fgColor="FFF2CC"),
@@ -1762,7 +2128,7 @@ def apply_excel_design(sheet, headers: list[str], header_row: int, image_column:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = border
-    sheet.row_dimensions[header_row].height = 32
+    sheet.row_dimensions[header_row].height = 26
 
     status_column = headers.index("Holat") + 1
     for row_number in range(header_row + 1, sheet.max_row + 1):
@@ -1779,37 +2145,40 @@ def apply_excel_design(sheet, headers: list[str], header_row: int, image_column:
             status_cell.alignment = Alignment(horizontal="center", vertical="center")
 
     width_by_header = {
-        "ID": 8,
-        "Sana": 18,
-        "Holat": 18,
-        "Telegram ID": 16,
-        "Username": 18,
-        "Ism-sharif": 28,
-        "Tug'ilgan sana": 16,
-        "Yosh": 8,
-        "Manzil": 34,
-        "Filial": 24,
-        "Ma'lumot": 20,
-        "Soha tajribasi": 20,
-        "Oldingi ish joyi": 32,
-        "Sudlangan": 14,
-        "Oilaviy holati": 32,
-        "Oldingi maosh": 18,
-        "Kutilayotgan maosh": 22,
-        "Word": 14,
-        "Excel": 14,
-        "Tillar": 24,
-        "Fariksda ishlash niyati": 22,
-        "Nega Fariks": 36,
-        "Telefon": 20,
-        "Rasm": 16,
-        "Rad sababi": 32,
-        "Qaror sanasi": 18,
-        "Qaror qilgan admin": 20,
+        "ID": 6,
+        "Sana": 16,
+        "Holat": 16,
+        "Telegram ID": 14,
+        "Username": 16,
+        "Ism-sharif": 24,
+        "Tug'ilgan sana": 14,
+        "Yosh": 7,
+        "Manzil": 28,
+        "Filial": 20,
+        "Ma'lumot": 18,
+        "Yo'nalish": 20,
+        "Mutaxassislik": 18,
+        "Soha tajribasi": 16,
+        "Sertifikat": 14,
+        "Oldingi ish joyi": 26,
+        "Sudlangan": 12,
+        "Oilaviy holati": 26,
+        "Oldingi maosh": 16,
+        "Kutilayotgan maosh": 18,
+        "Word": 12,
+        "Excel": 12,
+        "Tillar": 18,
+        "Fariksda ishlash niyati": 18,
+        "Nega Fariks": 28,
+        "Telefon": 18,
+        "Rasm": 12,
+        "Rad sababi": 24,
+        "Qaror sanasi": 16,
+        "Qaror qilgan admin": 18,
     }
     for index, header in enumerate(headers, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width_by_header.get(header, 18)
-    sheet.column_dimensions[get_column_letter(image_column)].width = 16
+    sheet.column_dimensions[get_column_letter(image_column)].width = 12
 
 
 async def sync_excel_file_with_images(context: ContextTypes.DEFAULT_TYPE) -> Path:
@@ -1852,9 +2221,10 @@ async def download_excel_images(
 
 def resize_image_for_excel(source_path: Path, target_path: Path) -> None:
     with PILImage.open(source_path) as image:
-        image.thumbnail((160, 160))
+        image = ImageOps.exif_transpose(image)
         if image.mode not in {"RGB", "L"}:
             image = image.convert("RGB")
+        image = ImageOps.fit(image, (120, 120), method=PILImage.Resampling.LANCZOS)
         image.save(target_path, format="JPEG", quality=82)
 
 
@@ -2381,6 +2751,7 @@ def main() -> None:
         entry_points=[
             CommandHandler("start", start),
             MessageHandler(filters.Regex(r"^(📝\s*)?Ariza yuborish$"), begin_application),
+            CallbackQueryHandler(subscription_check_callback, pattern=r"^sub:check$"),
         ],
         states={
             FULL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, full_name)],
@@ -2391,11 +2762,27 @@ def main() -> None:
                 CallbackQueryHandler(education_choice, pattern=r"^education:(higher|secondary)$"),
                 MessageHandler(filters.ALL, invalid_education),
             ],
+            JOB_DIRECTION: [
+                CallbackQueryHandler(job_direction_choice, pattern=r"^job:(admin|teacher|assistant)$"),
+                MessageHandler(filters.ALL, invalid_job_direction),
+            ],
+            SPECIALTY: [
+                CallbackQueryHandler(specialty_choice, pattern=r"^specialty:(math|physics|russian|english)$"),
+                MessageHandler(filters.ALL, invalid_specialty),
+            ],
             EXPERIENCE_CHOICE: [
                 CallbackQueryHandler(experience_choice_callback, pattern=r"^exp:(yes|no)$"),
                 MessageHandler(filters.ALL, invalid_experience_choice),
             ],
             EXPERIENCE_YEARS: [MessageHandler(filters.TEXT & ~filters.COMMAND, experience_years)],
+            CERTIFICATE_CHOICE: [
+                CallbackQueryHandler(certificate_choice_callback, pattern=r"^cert:(yes|no)$"),
+                MessageHandler(filters.ALL, invalid_certificate_choice),
+            ],
+            CERTIFICATE_PHOTO: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, certificate_photo),
+                MessageHandler(filters.ALL, invalid_certificate_photo),
+            ],
             PREVIOUS_JOB: [MessageHandler(filters.TEXT & ~filters.COMMAND, previous_job)],
             CONVICTED: [
                 CallbackQueryHandler(convicted_choice, pattern=r"^convicted:(yes|no)$"),
@@ -2419,7 +2806,7 @@ def main() -> None:
             REVIEW_APPLICATION: [
                 CallbackQueryHandler(review_callback, pattern=r"^review:(confirm|edit|cancel)$"),
                 CallbackQueryHandler(edit_field_callback, pattern=r"^edit:[a-z_]+$"),
-                CallbackQueryHandler(edit_value_callback, pattern=r"^editval:(education|convicted|word_level|excel_level):[a-z]+$"),
+                CallbackQueryHandler(edit_value_callback, pattern=r"^editval:(education|convicted|word_level|excel_level|job_direction|specialty|certificate_status):[a-z]+$"),
                 MessageHandler(filters.ALL, invalid_review_input),
             ],
             EDIT_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_field_text)],

@@ -107,6 +107,7 @@ REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL") or DEFAULT_REQUIRED_CHA
 EDUCATION_LABELS = {
     "higher": "Oliy ma'lumotli",
     "secondary": "O'rta maxsus",
+    "uneducated": "O'qimagan",
 }
 LEVEL_LABELS = {
     "unknown": "Bilmayman",
@@ -122,6 +123,13 @@ JOB_DIRECTION_LABELS = {
     "admin": "Admin",
     "teacher": "O'qituvchi",
     "assistant": "O'qituvchi yordamchi",
+    "cleaner": "Tozalik xodimi",
+    "branch_manager": "Filial rahbari",
+    "cashier": "Kassir",
+}
+TEACHER_DIRECTION_KEYS = {"teacher", "assistant"}
+TEACHER_DIRECTION_LABELS = {
+    JOB_DIRECTION_LABELS[key] for key in TEACHER_DIRECTION_KEYS
 }
 SPECIALTY_LABELS = {
     "math": "Matematika",
@@ -134,6 +142,7 @@ EDUCATION_KEYBOARD = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("🎓 Oliy ma'lumotli", callback_data="education:higher")],
         [InlineKeyboardButton("🏥 O'rta maxsus", callback_data="education:secondary")],
+        [InlineKeyboardButton("📘 O'qimagan", callback_data="education:uneducated")],
     ]
 )
 JOB_DIRECTION_KEYBOARD = InlineKeyboardMarkup(
@@ -141,6 +150,9 @@ JOB_DIRECTION_KEYBOARD = InlineKeyboardMarkup(
         [InlineKeyboardButton("🛠 Admin", callback_data="job:admin")],
         [InlineKeyboardButton("👨‍🏫 O'qituvchi", callback_data="job:teacher")],
         [InlineKeyboardButton("🤝 O'qituvchi yordamchi", callback_data="job:assistant")],
+        [InlineKeyboardButton("🧹 Tozalik xodimi", callback_data="job:cleaner")],
+        [InlineKeyboardButton("🏢 Filial rahbari", callback_data="job:branch_manager")],
+        [InlineKeyboardButton("💳 Kassir", callback_data="job:cashier")],
     ]
 )
 SPECIALTY_KEYBOARD = InlineKeyboardMarkup(
@@ -460,6 +472,13 @@ def get_admin_delivery_chat_ids() -> list[str]:
             chat_ids.append(admin_chat_id)
 
     return chat_ids
+
+
+def is_teacher_direction(data: dict) -> bool:
+    return (
+        data.get("job_direction_key") in TEACHER_DIRECTION_KEYS
+        or data.get("job_direction") in TEACHER_DIRECTION_LABELS
+    )
 
 
 def find_user_by_username(username: str) -> dict | None:
@@ -972,7 +991,7 @@ async def job_direction_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["job_direction_key"] = key
     await query.edit_message_text(f"6. 🚩 Yo'nalish: {JOB_DIRECTION_LABELS[key]}")
 
-    if key == "admin":
+    if key not in TEACHER_DIRECTION_KEYS:
         context.user_data["specialty"] = ""
         context.user_data["certificate_status"] = ""
         context.user_data["certificate_image"] = {}
@@ -1065,7 +1084,7 @@ async def experience_years(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         value = f"{value} yil"
 
     context.user_data["experience"] = value
-    if context.user_data.get("job_direction_key") in {"teacher", "assistant"}:
+    if is_teacher_direction(context.user_data):
         await update.message.reply_text(
             "9. 📜 Sertifikatingiz bormi?",
             reply_markup=CERTIFICATE_CHOICE_KEYBOARD,
@@ -1351,6 +1370,7 @@ def build_edit_value_keyboard(field: str) -> InlineKeyboardMarkup:
             [
                 [InlineKeyboardButton("🎓 Oliy ma'lumotli", callback_data="editval:education:higher")],
                 [InlineKeyboardButton("🏥 O'rta maxsus", callback_data="editval:education:secondary")],
+                [InlineKeyboardButton("📘 O'qimagan", callback_data="editval:education:uneducated")],
             ]
         )
 
@@ -1370,6 +1390,9 @@ def build_edit_value_keyboard(field: str) -> InlineKeyboardMarkup:
                 [InlineKeyboardButton("🛠 Admin", callback_data="editval:job_direction:admin")],
                 [InlineKeyboardButton("👨‍🏫 O'qituvchi", callback_data="editval:job_direction:teacher")],
                 [InlineKeyboardButton("🤝 O'qituvchi yordamchi", callback_data="editval:job_direction:assistant")],
+                [InlineKeyboardButton("🧹 Tozalik xodimi", callback_data="editval:job_direction:cleaner")],
+                [InlineKeyboardButton("🏢 Filial rahbari", callback_data="editval:job_direction:branch_manager")],
+                [InlineKeyboardButton("💳 Kassir", callback_data="editval:job_direction:cashier")],
             ]
         )
 
@@ -1488,11 +1511,8 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 def needs_certificate_image(data: dict) -> bool:
-    is_teacher_direction = data.get("job_direction_key") in {"teacher", "assistant"} or data.get(
-        "job_direction"
-    ) in {"O'qituvchi", "O'qituvchi yordamchi"}
     return (
-        is_teacher_direction
+        is_teacher_direction(data)
         and data.get("certificate_status") == "Bor"
         and not data.get("certificate_image")
     )
@@ -1538,7 +1558,7 @@ async def edit_value_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif field == "job_direction":
         context.user_data[field] = JOB_DIRECTION_LABELS[key]
         context.user_data["job_direction_key"] = key
-        if key == "admin":
+        if key not in TEACHER_DIRECTION_KEYS:
             context.user_data["specialty"] = ""
             context.user_data["certificate_status"] = ""
             context.user_data["certificate_image"] = {}
@@ -1698,11 +1718,7 @@ async def finish_application(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "phone",
         "recent_photo",
     ]
-    is_teacher_direction = context.user_data.get("job_direction_key") in {
-        "teacher",
-        "assistant",
-    } or context.user_data.get("job_direction") in {"O'qituvchi", "O'qituvchi yordamchi"}
-    if is_teacher_direction:
+    if is_teacher_direction(context.user_data):
         required_fields.extend(["specialty", "certificate_status"])
         if context.user_data.get("certificate_status") == "Bor":
             required_fields.append("certificate_image")
@@ -2917,11 +2933,14 @@ def main() -> None:
             ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address)],
             BRANCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, branch)],
             EDUCATION: [
-                CallbackQueryHandler(education_choice, pattern=r"^education:(higher|secondary)$"),
+                CallbackQueryHandler(education_choice, pattern=r"^education:(higher|secondary|uneducated)$"),
                 MessageHandler(filters.ALL, invalid_education),
             ],
             JOB_DIRECTION: [
-                CallbackQueryHandler(job_direction_choice, pattern=r"^job:(admin|teacher|assistant)$"),
+                CallbackQueryHandler(
+                    job_direction_choice,
+                    pattern=r"^job:(admin|teacher|assistant|cleaner|branch_manager|cashier)$",
+                ),
                 MessageHandler(filters.ALL, invalid_job_direction),
             ],
             SPECIALTY: [
@@ -2964,7 +2983,7 @@ def main() -> None:
             REVIEW_APPLICATION: [
                 CallbackQueryHandler(review_callback, pattern=r"^review:(confirm|edit|cancel)$"),
                 CallbackQueryHandler(edit_field_callback, pattern=r"^edit:[a-z_]+$"),
-                CallbackQueryHandler(edit_value_callback, pattern=r"^editval:(education|convicted|word_level|excel_level|job_direction|specialty|certificate_status):[a-z]+$"),
+                CallbackQueryHandler(edit_value_callback, pattern=r"^editval:(education|convicted|word_level|excel_level|job_direction|specialty|certificate_status):[a-z_]+$"),
                 MessageHandler(filters.ALL, invalid_review_input),
             ],
             EDIT_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_field_text)],

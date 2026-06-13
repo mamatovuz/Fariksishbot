@@ -36,6 +36,6 @@ oldin ariza ma'lumotlarini tekshirib, kerak bo'lsa tahrirlashi mumkin.
 Ariza boshlanishidan oldin foydalanuvchi `@fariks01` kanaliga obuna bo'lishi kerak.
 Obunani tekshirish ishlashi uchun bot kanalga admin qilib qo'yilishi kerak.
 
-Ma'lumot darajasidan keyin foydalanuvchi yo'nalishni tanlaydi: Admin, O'qituvchi yoki
-O'qituvchi yordamchi. O'qituvchi yo'nalishlarida mutaxassislik va sertifikat rasmi
-so'raladi.
+Ma'lumot darajasidan keyin foydalanuvchi yo'nalishni tanlaydi: Admin, O'qituvchi,
+O'qituvchi yordamchi, Tozalik xodimi, Filial rahbari yoki Kassir. O'qituvchi
+yo'nalishlarida mutaxassislik va sertifikat rasmi so'raladi.

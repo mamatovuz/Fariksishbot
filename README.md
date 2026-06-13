@@ -31,7 +31,9 @@ Admin paneldagi `📣 Xabar yuborish` tugmasi orqali barcha foydalanuvchilarga m
 rasm, video yoki GIF yuborish mumkin. Media captionidagi matn ham birga boradi.
 
 Foydalanuvchi tug'ilgan sanani kiritadi, bot yoshni avtomatik hisoblaydi. Rasm yuborishdan
-oldin ariza ma'lumotlarini tekshirib, kerak bo'lsa tahrirlashi mumkin.
+oldin ariza ma'lumotlarini tekshirib, kerak bo'lsa tahrirlashi mumkin. Oilaviy holat
+qismida avval jins tanlanadi, keyin erkak/ayolga mos oilaviy holat va farzand bor-yo'qligi
+inline tugmalar orqali olinadi.
 
 Ariza boshlanishidan oldin foydalanuvchi `@fariks01` kanaliga obuna bo'lishi kerak.
 Obunani tekshirish ishlashi uchun bot kanalga admin qilib qo'yilishi kerak.

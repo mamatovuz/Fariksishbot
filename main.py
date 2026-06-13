@@ -83,7 +83,9 @@ REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL") or DEFAULT_REQUIRED_CHA
     CERTIFICATE_PHOTO,
     PREVIOUS_JOB,
     CONVICTED,
+    GENDER,
     FAMILY_STATUS,
+    CHILDREN_STATUS,
     PREVIOUS_SALARY,
     EXPECTED_SALARY,
     WORD_LEVEL,
@@ -95,7 +97,7 @@ REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL") or DEFAULT_REQUIRED_CHA
     RECENT_PHOTO,
     REVIEW_APPLICATION,
     EDIT_FIELD,
-) = range(25)
+) = range(27)
 (
     ADD_ADMIN_TARGET,
     REMOVE_ADMIN_TARGET,
@@ -118,6 +120,24 @@ LEVEL_LABELS = {
 YES_NO_LABELS = {
     "yes": "Ha",
     "no": "Yo'q",
+}
+GENDER_LABELS = {
+    "male": "Erkak",
+    "female": "Ayol",
+}
+CHILDREN_LABELS = {
+    "yes": "Farzandim bor",
+    "no": "Farzandim yo'q",
+}
+FAMILY_STATUS_LABELS = {
+    "male": {
+        "married": "Uylangan",
+        "single": "Uylanmagan",
+    },
+    "female": {
+        "married": "Turmush qurgan",
+        "single": "Turmush qurmagan",
+    },
 }
 JOB_DIRECTION_LABELS = {
     "admin": "Admin",
@@ -188,6 +208,22 @@ CONVICTED_KEYBOARD = InlineKeyboardMarkup(
         [
             InlineKeyboardButton("✅ Ha", callback_data="convicted:yes"),
             InlineKeyboardButton("❌ Yo'q", callback_data="convicted:no"),
+        ]
+    ]
+)
+GENDER_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("👨 Erkak", callback_data="gender:male"),
+            InlineKeyboardButton("👩 Ayol", callback_data="gender:female"),
+        ]
+    ]
+)
+CHILDREN_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("👶 Farzandim bor", callback_data="children:yes"),
+            InlineKeyboardButton("🚫 Farzandim yo'q", callback_data="children:no"),
         ]
     ]
 )
@@ -300,7 +336,9 @@ def init_db() -> None:
                 certificate_json TEXT NOT NULL DEFAULT '{}',
                 previous_job TEXT NOT NULL DEFAULT '',
                 convicted TEXT NOT NULL DEFAULT '',
+                gender TEXT NOT NULL DEFAULT '',
                 family_status TEXT NOT NULL DEFAULT '',
+                children_status TEXT NOT NULL DEFAULT '',
                 previous_salary TEXT NOT NULL DEFAULT '',
                 expected_salary TEXT NOT NULL DEFAULT '',
                 word_level TEXT NOT NULL DEFAULT '',
@@ -339,7 +377,9 @@ def init_db() -> None:
                 "certificate_json": "TEXT NOT NULL DEFAULT '{}'",
                 "previous_job": "TEXT NOT NULL DEFAULT ''",
                 "convicted": "TEXT NOT NULL DEFAULT ''",
+                "gender": "TEXT NOT NULL DEFAULT ''",
                 "family_status": "TEXT NOT NULL DEFAULT ''",
+                "children_status": "TEXT NOT NULL DEFAULT ''",
                 "previous_salary": "TEXT NOT NULL DEFAULT ''",
                 "expected_salary": "TEXT NOT NULL DEFAULT ''",
                 "word_level": "TEXT NOT NULL DEFAULT ''",
@@ -479,6 +519,23 @@ def is_teacher_direction(data: dict) -> bool:
         data.get("job_direction_key") in TEACHER_DIRECTION_KEYS
         or data.get("job_direction") in TEACHER_DIRECTION_LABELS
     )
+
+
+def family_status_keyboard(gender_key: str | None) -> InlineKeyboardMarkup:
+    labels = FAMILY_STATUS_LABELS.get(gender_key or "male", FAMILY_STATUS_LABELS["male"])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(f"💍 {labels['married']}", callback_data="family:married"),
+                InlineKeyboardButton(f"🙋 {labels['single']}", callback_data="family:single"),
+            ]
+        ]
+    )
+
+
+def family_status_label(gender_key: str | None, family_key: str) -> str:
+    labels = FAMILY_STATUS_LABELS.get(gender_key or "male", FAMILY_STATUS_LABELS["male"])
+    return labels[family_key]
 
 
 def find_user_by_username(username: str) -> dict | None:
@@ -625,12 +682,12 @@ def create_application(user, user_data: dict) -> int:
             INSERT INTO applications (
                 user_id, username, full_name, birth_date, address, branch, education,
                 job_direction, specialty, phone, experience, certificate_status,
-                certificate_json, previous_job, convicted, family_status,
+                certificate_json, previous_job, convicted, gender, family_status, children_status,
                 previous_salary, expected_salary, word_level, excel_level, languages,
                 fariks_duration, motivation, recent_photo_json, role, age, direction,
                 certificates_json, certificate_count, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 0, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 0, 'pending', ?)
             """,
             (
                 user.id,
@@ -648,7 +705,9 @@ def create_application(user, user_data: dict) -> int:
                 json.dumps(certificate, ensure_ascii=False),
                 user_data["previous_job"],
                 user_data["convicted"],
+                user_data["gender"],
                 user_data["family_status"],
+                user_data["children_status"],
                 user_data["previous_salary"],
                 user_data["expected_salary"],
                 user_data["word_level"],
@@ -782,7 +841,9 @@ def row_to_application(row: sqlite3.Row | dict) -> dict:
         "certificate_image": json.loads(row_data.get("certificate_json") or "{}"),
         "previous_job": row_data.get("previous_job", ""),
         "convicted": row_data.get("convicted", ""),
+        "gender": row_data.get("gender", ""),
         "family_status": row_data.get("family_status", ""),
+        "children_status": row_data.get("children_status", ""),
         "previous_salary": row_data.get("previous_salary", ""),
         "expected_salary": row_data.get("expected_salary", ""),
         "word_level": row_data.get("word_level", ""),
@@ -1172,9 +1233,10 @@ async def convicted_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data["convicted"] = YES_NO_LABELS[key]
     await query.edit_message_text(f"8. ⚖️ Sudlangan: {YES_NO_LABELS[key]}")
     await query.message.reply_text(
-        "9. 👪 Oilaviy holatingiz qanday? Farzandlaringiz bormi?"
+        "9. 🚻 Jinsingizni tanlang.",
+        reply_markup=GENDER_KEYBOARD,
     )
-    return FAMILY_STATUS
+    return GENDER
 
 
 async def invalid_convicted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1186,15 +1248,78 @@ async def invalid_convicted(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return CONVICTED
 
 
-async def family_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    value = update.message.text.strip()
-    if len(value) < 2:
-        await update.message.reply_text("Oilaviy holatingizni qisqacha yozing.")
-        return FAMILY_STATUS
+async def gender_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
 
-    context.user_data["family_status"] = value
-    await update.message.reply_text("10. 💰 Oxirgi ish joyingizda qancha maosh olgansiz?")
+    key = query.data.split(":", 1)[1]
+    context.user_data["gender"] = GENDER_LABELS[key]
+    context.user_data["gender_key"] = key
+    await query.edit_message_text(f"9. 🚻 Jins: {GENDER_LABELS[key]}")
+    await query.message.reply_text(
+        "10. 👪 Oilaviy holatingiz qanday?",
+        reply_markup=family_status_keyboard(key),
+    )
+    return FAMILY_STATUS
+
+
+async def invalid_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await reply_to_update(
+        update,
+        "Iltimos, jinsingizni tugmalardan tanlang.",
+        reply_markup=GENDER_KEYBOARD,
+    )
+    return GENDER
+
+
+async def family_status_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    key = query.data.split(":", 1)[1]
+    gender_key = context.user_data.get("gender_key", "male")
+    value = family_status_label(gender_key, key)
+    context.user_data["marital_status"] = value
+    await query.edit_message_text(f"10. 👪 Oilaviy holat: {value}")
+    await query.message.reply_text(
+        "11. 👶 Farzandingiz bormi?",
+        reply_markup=CHILDREN_KEYBOARD,
+    )
+    return CHILDREN_STATUS
+
+
+async def invalid_family_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    gender_key = context.user_data.get("gender_key", "male")
+    await reply_to_update(
+        update,
+        "Iltimos, oilaviy holatni tugmalardan tanlang.",
+        reply_markup=family_status_keyboard(gender_key),
+    )
+    return FAMILY_STATUS
+
+
+async def children_status_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    key = query.data.split(":", 1)[1]
+    children_status = CHILDREN_LABELS[key]
+    context.user_data["children_status"] = children_status
+    context.user_data["family_status"] = (
+        f"{context.user_data.get('marital_status', '')}, {children_status.lower()}"
+    ).strip(", ")
+    await query.edit_message_text(f"11. 👶 Farzand: {children_status}")
+    await query.message.reply_text("12. 💰 Oxirgi ish joyingizda qancha maosh olgansiz?")
     return PREVIOUS_SALARY
+
+
+async def invalid_children_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await reply_to_update(
+        update,
+        "Iltimos, farzand bo'yicha tugmalardan birini tanlang.",
+        reply_markup=CHILDREN_KEYBOARD,
+    )
+    return CHILDREN_STATUS
 
 
 async def previous_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1204,7 +1329,7 @@ async def previous_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return PREVIOUS_SALARY
 
     context.user_data["previous_salary"] = value
-    await update.message.reply_text("11. 💵 Qancha maoshga ishlashni xohlaysiz?")
+    await update.message.reply_text("13. 💵 Qancha maoshga ishlashni xohlaysiz?")
     return EXPECTED_SALARY
 
 
@@ -1216,7 +1341,7 @@ async def expected_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     context.user_data["expected_salary"] = value
     await update.message.reply_text(
-        "12. 📝 Microsoft Word dasturini bilish darajangizni tanlang.",
+        "14. 📝 Microsoft Word dasturini bilish darajangizni tanlang.",
         reply_markup=WORD_LEVEL_KEYBOARD,
     )
     return WORD_LEVEL
@@ -1228,9 +1353,9 @@ async def word_level_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     key = query.data.split(":", 1)[1]
     context.user_data["word_level"] = LEVEL_LABELS[key]
-    await query.edit_message_text(f"12. 📝 Word: {LEVEL_LABELS[key]}")
+    await query.edit_message_text(f"14. 📝 Word: {LEVEL_LABELS[key]}")
     await query.message.reply_text(
-        "13. 📊 Microsoft Excel dasturini bilish darajangizni tanlang.",
+        "15. 📊 Microsoft Excel dasturini bilish darajangizni tanlang.",
         reply_markup=EXCEL_LEVEL_KEYBOARD,
     )
     return EXCEL_LEVEL
@@ -1251,9 +1376,9 @@ async def excel_level_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     key = query.data.split(":", 1)[1]
     context.user_data["excel_level"] = LEVEL_LABELS[key]
-    await query.edit_message_text(f"13. 📊 Excel: {LEVEL_LABELS[key]}")
+    await query.edit_message_text(f"15. 📊 Excel: {LEVEL_LABELS[key]}")
     await query.message.reply_text(
-        "14. 🌐 Qaysi tillarni bilasiz va qay darajada?\nMasalan: O'zbekcha yaxshi, Ruscha o'rtacha"
+        "16. 🌐 Qaysi tillarni bilasiz va qay darajada?\nMasalan: O'zbekcha yaxshi, Ruscha o'rtacha"
     )
     return LANGUAGES
 
@@ -1275,7 +1400,7 @@ async def languages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data["languages"] = value
     await update.message.reply_text(
-        "15. ⏳ “Fariks O'quv markazi”da necha yil ishlash niyatingiz bor?"
+        "17. ⏳ “Fariks O'quv markazi”da necha yil ishlash niyatingiz bor?"
     )
     return FARIKS_DURATION
 
@@ -1288,7 +1413,7 @@ async def fariks_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     context.user_data["fariks_duration"] = value
     await update.message.reply_text(
-        "16. ❓ Nima uchun aynan “Fariks”da ishlashni xohlaysiz?"
+        "18. ❓ Nima uchun aynan “Fariks”da ishlashni xohlaysiz?"
     )
     return MOTIVATION
 
@@ -1300,7 +1425,7 @@ async def motivation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return MOTIVATION
 
     context.user_data["motivation"] = value
-    await update.message.reply_text("17. 📞 Telefon raqamingizni yozing. Masalan: +998901234567")
+    await update.message.reply_text("19. 📞 Telefon raqamingizni yozing. Masalan: +998901234567")
     return PHONE
 
 
@@ -1342,6 +1467,7 @@ def build_edit_fields_keyboard() -> InlineKeyboardMarkup:
         ("💼 Tajriba", "experience"),
         ("🏬 Oldingi ish", "previous_job"),
         ("⚖️ Sudlangan", "convicted"),
+        ("🚻 Jins", "gender"),
         ("👪 Oilaviy holat", "family_status"),
         ("💰 Oldingi maosh", "previous_salary"),
         ("💵 Kutilgan maosh", "expected_salary"),
@@ -1380,6 +1506,16 @@ def build_edit_value_keyboard(field: str) -> InlineKeyboardMarkup:
                 [
                     InlineKeyboardButton("✅ Ha", callback_data="editval:convicted:yes"),
                     InlineKeyboardButton("❌ Yo'q", callback_data="editval:convicted:no"),
+                ]
+            ]
+        )
+
+    if field == "gender":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("👨 Erkak", callback_data="editval:gender:male"),
+                    InlineKeyboardButton("👩 Ayol", callback_data="editval:gender:female"),
                 ]
             ]
         )
@@ -1458,6 +1594,7 @@ def build_review_text(data: dict) -> str:
         f"💼 Soha tajribasi: {data.get('experience', '')}\n"
         f"🏬 Oldingi ish joyi: {data.get('previous_job', '')}\n"
         f"⚖️ Sudlangan: {data.get('convicted', '')}\n"
+        f"🚻 Jins: {data.get('gender', '')}\n"
         f"👪 Oilaviy holati: {data.get('family_status', '')}\n"
         f"💰 Oldingi maosh: {data.get('previous_salary', '')}\n"
         f"💵 Kutilayotgan maosh: {data.get('expected_salary', '')}\n"
@@ -1490,7 +1627,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text("📜 Sertifikat rasmini yuboring.")
             return CERTIFICATE_PHOTO
 
-        await query.message.reply_text("18. 📷 Oxirgi 1 oy ichida tushgan rasmingizni yuboring.")
+        await query.message.reply_text("20. 📷 Oxirgi 1 oy ichida tushgan rasmingizni yuboring.")
         return RECENT_PHOTO
 
     if action == "edit":
@@ -1531,6 +1668,7 @@ async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if field in {
         "education",
         "convicted",
+        "gender",
         "word_level",
         "excel_level",
         "job_direction",
@@ -1570,6 +1708,9 @@ async def edit_value_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data["certificate_image"] = {}
     elif field == "convicted":
         context.user_data[field] = YES_NO_LABELS[key]
+    elif field == "gender":
+        context.user_data[field] = GENDER_LABELS[key]
+        context.user_data["gender_key"] = key
     elif field in {"word_level", "excel_level"}:
         context.user_data[field] = LEVEL_LABELS[key]
 
@@ -1627,6 +1768,7 @@ def edit_field_prompt(field: str) -> str:
         "experience": "Yangi tajribani yozing. Masalan: 3 yil",
         "previous_job": "Oldingi ish joyi haqida yangi ma'lumot yozing.",
         "convicted": "Sudlanganlik holatini tanlang.",
+        "gender": "Jinsingizni tanlang.",
         "family_status": "Oilaviy holatni qayta yozing.",
         "previous_salary": "Oldingi maoshni qayta yozing.",
         "expected_salary": "Kutilayotgan maoshni qayta yozing.",
@@ -1707,7 +1849,9 @@ async def finish_application(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "experience",
         "previous_job",
         "convicted",
+        "gender",
         "family_status",
+        "children_status",
         "previous_salary",
         "expected_salary",
         "word_level",
@@ -1957,6 +2101,7 @@ def build_application_caption(application: dict) -> str:
         f"💼 Soha tajribasi: {application['experience']}\n"
         f"🏬 Oldingi ish joyi: {application['previous_job']}\n"
         f"⚖️ Sudlangan: {application['convicted']}\n"
+        f"🚻 Jins: {application['gender']}\n"
         f"👪 Oilaviy holati: {application['family_status']}\n"
         f"💰 Oldingi maosh: {application['previous_salary']}\n"
         f"💵 Kutilayotgan maosh: {application['expected_salary']}\n"
@@ -2155,6 +2300,7 @@ def sync_excel_file(
         "Sertifikat",
         "Oldingi ish joyi",
         "Sudlangan",
+        "Jins",
         "Oilaviy holati",
         "Oldingi maosh",
         "Kutilayotgan maosh",
@@ -2190,6 +2336,7 @@ def sync_excel_file(
                 application["certificate_status"],
                 application["previous_job"],
                 application["convicted"],
+                application["gender"],
                 application["family_status"],
                 application["previous_salary"],
                 application["expected_salary"],
@@ -2965,7 +3112,18 @@ def main() -> None:
                 CallbackQueryHandler(convicted_choice, pattern=r"^convicted:(yes|no)$"),
                 MessageHandler(filters.ALL, invalid_convicted),
             ],
-            FAMILY_STATUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, family_status)],
+            GENDER: [
+                CallbackQueryHandler(gender_choice, pattern=r"^gender:(male|female)$"),
+                MessageHandler(filters.ALL, invalid_gender),
+            ],
+            FAMILY_STATUS: [
+                CallbackQueryHandler(family_status_choice, pattern=r"^family:(married|single)$"),
+                MessageHandler(filters.ALL, invalid_family_status),
+            ],
+            CHILDREN_STATUS: [
+                CallbackQueryHandler(children_status_choice, pattern=r"^children:(yes|no)$"),
+                MessageHandler(filters.ALL, invalid_children_status),
+            ],
             PREVIOUS_SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, previous_salary)],
             EXPECTED_SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, expected_salary)],
             WORD_LEVEL: [
@@ -2983,7 +3141,7 @@ def main() -> None:
             REVIEW_APPLICATION: [
                 CallbackQueryHandler(review_callback, pattern=r"^review:(confirm|edit|cancel)$"),
                 CallbackQueryHandler(edit_field_callback, pattern=r"^edit:[a-z_]+$"),
-                CallbackQueryHandler(edit_value_callback, pattern=r"^editval:(education|convicted|word_level|excel_level|job_direction|specialty|certificate_status):[a-z_]+$"),
+                CallbackQueryHandler(edit_value_callback, pattern=r"^editval:(education|convicted|gender|word_level|excel_level|job_direction|specialty|certificate_status):[a-z_]+$"),
                 MessageHandler(filters.ALL, invalid_review_input),
             ],
             EDIT_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_field_text)],
